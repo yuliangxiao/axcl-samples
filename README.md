@@ -139,22 +139,21 @@ build-win\examples\axcl\axcl_yolo26.exe -m D:\models\yolo26n.axmodel -s "rtsp://
 
 该目标默认不参与构建，避免没有 FFmpeg 开发包时影响已有示例。以下命令均在 Visual Studio 2022 Developer Command Prompt（开发者命令提示符）中执行。
 
-配置路径：
+进入源码目录并配置运行时 `PATH`：
 
 ```cmd
 cd /d D:\axcl-samples
-set "AXCL_DIR=D:\AXCL\axcl\out\axcl_win_x64"
-set "FFMPEG_DIR=D:\AXCL\axcl\3rdparty\ffmpeg\win64"
-set "OpenCV_DIR=D:\opencv\opencv\build\x64\vc16\lib"
-set "PATH=D:\ninja-win;%AXCL_DIR%\bin;%FFMPEG_DIR%\lib;D:\opencv\opencv\build\x64\vc16\bin;%PATH%"
+set "PATH=D:\ninja-win;D:\AXCL\axcl\out\axcl_win_x64\bin;D:\AXCL\axcl\3rdparty\ffmpeg\win64\lib;D:\opencv\opencv\build\x64\vc16\bin;%PATH%"
 ```
 
 配置并只编译原生 RTSP 目标：
 
 ```cmd
-cmake -S . -B build-native -G Ninja -DCMAKE_BUILD_TYPE=Release -DAXCL_DIR=%AXCL_DIR% -DFFMPEG_DIR=%FFMPEG_DIR% -DOpenCV_DIR=%OpenCV_DIR% -DAXCL_BUILD_YOLO26_RTSP_NATIVE=ON
+cmake -S . -B build-native -G Ninja -DCMAKE_BUILD_TYPE=Release -DAXCL_DIR=D:\AXCL\axcl\out\axcl_win_x64 -DFFMPEG_DIR=D:\AXCL\axcl\3rdparty\ffmpeg\win64 -DOpenCV_DIR=D:\opencv\opencv\build\x64\vc16\lib -DAXCL_BUILD_YOLO26_RTSP_NATIVE=ON
 cmake --build build-native --target ax_yolo26_rtsp_native -j 4
 ```
+
+`OpenCV_DIR` 必须指向包含 `OpenCVConfig.cmake` 的目录；如果 OpenCV 安装位置不同，请相应替换以上绝对路径。
 
 生成程序位于：
 

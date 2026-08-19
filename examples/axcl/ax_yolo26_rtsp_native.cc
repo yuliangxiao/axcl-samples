@@ -56,6 +56,7 @@ extern "C" {
 
 #include <opencv2/opencv.hpp>
 
+#include <ax_buffer_tool.h>
 #include <axcl.h>
 #include <axcl_ivps.h>
 #include <axcl_rt_context.h>
