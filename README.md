@@ -129,6 +129,87 @@ build-win\examples\axcl\axcl_yolo26.exe -m D:\models\yolo26n.axmodel -s "rtsp://
 
 程序不保存结果图片或视频，也不创建 `output` 目录。模型加载、AXCL 初始化及 5 次预热不计入正式统计。启动日志会隐藏 RTSP 密码，但默认地址仍以明文存在于源码中。
 
+## Windows 原生 RTSP 硬解码 + YOLO26
+
+`ax_yolo26_rtsp_native.exe` 是独立目标，不改变上面的 `axcl_yolo26`。它提供三个运行模式：
+
+- `vdec-smoke`：FFmpeg `libavformat` RTSP 解封装 → AXCL Native VDEC；
+- `ivps-smoke`：VDEC NV12 → AXCL Native IVPS 640×640 BGR，黑色居中 letterbox；
+- `infer`：IVPS CMM（连续媒体内存）直接绑定 `ax_runner_axcl` 输入，再执行 YOLO26 和 CPU 后处理。
+
+该目标默认不参与构建，避免没有 FFmpeg 开发包时影响已有示例。以下命令均在 Visual Studio 2022 Developer Command Prompt（开发者命令提示符）中执行。
+
+配置路径：
+
+```cmd
+cd /d D:\axcl-samples
+set "AXCL_DIR=D:\AXCL\axcl\out\axcl_win_x64"
+set "FFMPEG_DIR=D:\AXCL\axcl\3rdparty\ffmpeg\win64"
+set "OpenCV_DIR=D:\opencv\opencv\build\x64\vc16\lib"
+set "PATH=D:\ninja-win;%AXCL_DIR%\bin;%FFMPEG_DIR%\lib;D:\opencv\opencv\build\x64\vc16\bin;%PATH%"
+```
+
+配置并只编译原生 RTSP 目标：
+
+```cmd
+cmake -S . -B build-native -G Ninja -DCMAKE_BUILD_TYPE=Release -DAXCL_DIR=%AXCL_DIR% -DFFMPEG_DIR=%FFMPEG_DIR% -DOpenCV_DIR=%OpenCV_DIR% -DAXCL_BUILD_YOLO26_RTSP_NATIVE=ON
+cmake --build build-native --target ax_yolo26_rtsp_native -j 4
+```
+
+生成程序位于：
+
+```text
+build-native\examples\axcl\ax_yolo26_rtsp_native.exe
+```
+
+下列命令中的 RTSP URL 只作为格式示例，请替换为实际地址。程序日志会隐藏密码；源码和默认参数不保存 RTSP 凭据。
+
+### 阶段一：VDEC smoke
+
+```cmd
+build-native\examples\axcl\ax_yolo26_rtsp_native.exe --mode vdec-smoke --duration 60 --source "rtsp://user:password@192.168.0.201:554/Streaming/Channels/101"
+```
+
+验收条件：
+
+- 连续运行不少于 60 秒并正常退出；
+- `input_packets`、`sent_au`、`decoded_frames` 持续增加；
+- 输出为 `2560x1440`、NV12，`decoded_fps` 接近视频源帧率；
+- 最终日志中 `vdec_errors=0`、`vdec_hw_errors=0`、`ffmpeg_errors=0`；
+- `full_retries` 可以非零，但不能持续增长并导致 FPS 停滞。
+
+### 阶段二：IVPS smoke
+
+```cmd
+build-native\examples\axcl\ax_yolo26_rtsp_native.exe --mode ivps-smoke --duration 60 --dump-ivps native_640x640.bgr --source "rtsp://user:password@192.168.0.201:554/Streaming/Channels/101"
+```
+
+验收条件：
+
+- 阶段一的条件继续成立；
+- `ivps_frames` 持续增加且 `ivps_errors=0`；
+- `native_640x640.bgr` 恰好为 `1228800` 字节；
+- 诊断帧是 640×640 packed BGR，2560×1440 内容应缩放为 640×360，并在上、下各产生 140 像素黑边。
+
+`--dump-ivps` 仅回读第一帧用于诊断，不执行 Host resize 或 CSC（色彩空间转换）；不指定该参数时，IVPS像素不会回到Host。
+
+### 阶段三：完整推理
+
+模型默认沿用 `D:\yolo26\yolo26m.axmodel`，也可以用 `--model` 覆盖：
+
+```cmd
+build-native\examples\axcl\ax_yolo26_rtsp_native.exe --mode infer --duration 60 --model "D:\yolo26\yolo26m.axmodel" --source "rtsp://user:password@192.168.0.201:554/Streaming/Channels/101"
+```
+
+验收条件：
+
+- 启动日志包含 `direct device input bound`、`auto_sync_before=false` 和 `auto_sync_after=true`；
+- `infer_frames` 持续增加，`infer_errors=0`，并输出 `[DETECTION]`/`[OBJECT]`；
+- VDEC、IVPS、FFmpeg错误计数仍为 0；
+- 正式链路没有 Host 视频解码、resize、CSC或NPU输入H2D复制。
+
+首版固定为单路、单线程串行、H.264、2560×1440、RTSP over TCP，不重连、不创建队列、不主动做负载丢帧。若读取超时或流结束，程序会记录错误并退出，便于根据首个错误定位问题。
+
 ## Linux 编译简版
 
 确保 AXCL 头文件、运行库和 OpenCV 已安装。默认情况下，项目会从 `/usr/include/axcl` 和 `/usr/lib/axcl` 查找 AXCL。
