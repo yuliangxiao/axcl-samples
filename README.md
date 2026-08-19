@@ -98,7 +98,7 @@ build-win\examples\axcl\axcl_yolo26.exe
 
 ### 4. 运行 YOLO26
 
-程序默认读取 `D:\yolo26\yolo26x.axmodel`，并批量识别 `D:\yolo26\images` 第一层目录中的图片。
+程序默认读取 `D:\yolo26\yolo26m.axmodel`，通过 OpenCV 打开源码中配置的 RTSP 实时流，并使用窗口显示识别结果。默认地址可以通过 `--source` 覆盖。
 
 运行前把 AXCL 和 OpenCV 的 DLL（动态链接库）目录临时加入 `PATH`：
 
@@ -112,13 +112,22 @@ set "PATH=D:\AXCL\axcl\out\axcl_win_x64\bin;D:\opencv\opencv\build\x64\vc16\bin;
 build-win\examples\axcl\axcl_yolo26.exe
 ```
 
-也可以通过 `-m` 和 `-i` 临时覆盖模型文件和输入目录：
+也可以通过 `-m` 和 `-s` 临时覆盖模型文件和 RTSP 地址：
 
 ```cmd
-build-win\examples\axcl\axcl_yolo26.exe -m D:\models\yolo26n.axmodel -i D:\data\images
+build-win\examples\axcl\axcl_yolo26.exe -m D:\models\yolo26n.axmodel -s "rtsp://user:password@192.168.0.201:554/Streaming/Channels/101"
 ```
 
-程序按文件名顺序处理输入目录第一层的 `.jpg`、`.jpeg`、`.png`、`.bmp`、`.webp`、`.tif` 和 `.tiff` 文件，扩展名不区分大小写。绘制结果保留原文件名和格式，写入输入目录同级的 `output` 文件夹。程序逐张输出从图片读取到结果写盘的完整识别耗时，并在最后输出平均、最小和最大耗时；模型加载、资源初始化及 5 次预热不计入该耗时。
+程序优先使用 OpenCV 的 FFmpeg（多媒体编解码库）后端，失败时回退到 OpenCV 自动选择的后端，并在启动时打印实际后端。使用 OpenCV 4.5.2 及以上版本时，会向后端请求将 RTSP 打开和单次读取超时设为 5 秒；旧版本会在启动日志中提示不支持该超时参数。后台取流线程只保留最新帧，识别速度低于码流帧率时会主动丢弃旧帧，避免显示画面持续落后。
+
+预览窗口最大为 `1280×720`，显示检测框、类别、置信度以及以下数据：
+
+- `FPS`：最近一秒实际完成识别并显示的帧数；
+- `MAX`：根据最近一秒完整消费端耗时估算的最大处理帧数。
+
+控制台每秒输出取流/解码、预处理、H2D（主机到设备）、NPU（神经网络处理器）执行、D2H（设备到主机）、后处理及绘制显示的耗时，并输出启发式瓶颈判断。`VideoCapture::read()` 的耗时同时包含网络等待、RTSP 处理和 CPU 解码，不能单独视为 CPU 解码耗时。按 `Q`、`Esc` 或关闭窗口退出，退出时打印全程汇总。
+
+程序不保存结果图片或视频，也不创建 `output` 目录。模型加载、AXCL 初始化及 5 次预热不计入正式统计。启动日志会隐藏 RTSP 密码，但默认地址仍以明文存在于源码中。
 
 ## Linux 编译简版
 
@@ -132,7 +141,7 @@ cmake --build build --target axcl_yolo26 -j 4
 运行示例：
 
 ```bash
-./build/examples/axcl/axcl_yolo26 -m yolo26n.axmodel -i images
+./build/examples/axcl/axcl_yolo26 -m yolo26n.axmodel -s "rtsp://user:password@192.168.0.201:554/Streaming/Channels/101"
 ```
 
 ## 常见问题
@@ -143,6 +152,8 @@ cmake --build build --target axcl_yolo26 -j 4
 | 找不到 `OpenCVConfig.cmake` | 将 `OpenCV_DIR` 指向实际包含该文件的目录 |
 | 链接时报 `LNK1181` 或找不到 AXCL 库 | 确认 `AXCL_DIR\lib\libaxcl_rt.lib` 存在 |
 | 运行时提示缺少 DLL | 将 AXCL 和 OpenCV 的 `bin` 目录加入 `PATH` |
+| RTSP 无法打开或没有 FFmpeg 后端 | 确认 OpenCV 启用了 `videoio`/FFmpeg，并确认 OpenCV `bin` 目录中的视频 I/O 与 FFmpeg DLL 可被程序加载 |
+| 实际 FPS 明显低于 `MAX` | 先检查摄像头源帧率及控制台中的取流/解码 FPS；`MAX` 不包含等待摄像头送来下一帧的时间 |
 | 程序无法发现 AX8850 | 先运行 `axcl-smi`，检查驱动、Runtime 和 PCIe 连接 |
 | 修改环境后仍使用旧配置 | 删除 `build-win` 后重新执行 CMake 配置 |
 

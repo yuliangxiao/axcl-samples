@@ -15,20 +15,26 @@
  */
 
 /*
- * Note: For the YOLO11 series exported by the ultralytics project.
+ * Note: For the YOLO26 series exported by the ultralytics project.
  * Author: LittleMouse
  */
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
-#include <cctype>
+#include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#include <limits>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -42,22 +48,33 @@
 #endif
 
 #include <opencv2/opencv.hpp>
+
+#if CV_VERSION_MAJOR > 4 || \
+    (CV_VERSION_MAJOR == 4 && (CV_VERSION_MINOR > 5 || (CV_VERSION_MINOR == 5 && CV_VERSION_REVISION >= 2)))
+#define AXCL_OPENCV_CAPTURE_TIMEOUT_SUPPORTED 1
+#else
+#define AXCL_OPENCV_CAPTURE_TIMEOUT_SUPPORTED 0
+#endif
+
 #include "base/common.hpp"
 #include "base/detection.hpp"
-
 #include "utilities/args.hpp"
 #include "utilities/cmdline.hpp"
 #include "utilities/file.hpp"
+
 #include <axcl.h>
 #include "ax_model_runner/ax_model_runner_axcl.hpp"
 
-const int DEFAULT_IMG_H = 640;
-const int DEFAULT_IMG_W = 640;
-const int WARMUP_COUNT = 5;
+constexpr int DEFAULT_IMG_H = 640;
+constexpr int DEFAULT_IMG_W = 640;
+constexpr int WARMUP_COUNT = 5;
+constexpr int PREVIEW_MAX_WIDTH = 1280;
+constexpr int PREVIEW_MAX_HEIGHT = 720;
+constexpr int CAPTURE_TIMEOUT_MS = 5000;
 
 const char *DEFAULT_MODEL_FILE = R"(D:\yolo26\yolo26m.axmodel)";
-const char *DEFAULT_INPUT_DIR = R"(D:\yolo26\images)";
-const char *DEFAULT_OUTPUT_DIR_NAME = "output";
+const char *DEFAULT_RTSP_SOURCE = R"(rtsp://admin:Htl20243@192.168.0.201:554/Streaming/Channels/101)";
+const char *WINDOW_NAME = "AXCL YOLO26 RTSP";
 
 const char *CLASS_NAMES[] = {
     "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light",
@@ -70,10 +87,9 @@ const char *CLASS_NAMES[] = {
     "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors", "teddy bear",
     "hair drier", "toothbrush"};
 
-int NUM_CLASS = 80;
-
-const float PROB_THRESHOLD = 0.45f;
-const float NMS_THRESHOLD = 0.45f;
+constexpr int NUM_CLASS = 80;
+constexpr float PROB_THRESHOLD = 0.45f;
+constexpr float NMS_THRESHOLD = 0.45f;
 
 namespace fs = std::filesystem;
 
@@ -81,14 +97,34 @@ namespace
 {
     using Clock = std::chrono::steady_clock;
 
-    std::string path_for_log(const fs::path &path)
+    struct RunningMetric
     {
-        return path.u8string();
-    }
+        uint64_t count = 0;
+        double total = 0.0;
+        double minimum = std::numeric_limits<double>::max();
+        double maximum = 0.0;
+
+        void add(double value)
+        {
+            if (!std::isfinite(value) || value < 0.0)
+            {
+                return;
+            }
+
+            ++count;
+            total += value;
+            minimum = std::min(minimum, value);
+            maximum = std::max(maximum, value);
+        }
+
+        double average() const
+        {
+            return count == 0 ? 0.0 : total / static_cast<double>(count);
+        }
+    };
 
     struct RecognitionTiming
     {
-        double image_load_ms = 0.0;
         double preprocess_ms = 0.0;
         double input_copy_ms = 0.0;
         double inference_call_ms = 0.0;
@@ -97,7 +133,69 @@ namespace
         double device_to_host_ms = 0.0;
         double postprocess_ms = 0.0;
         double recognition_pipeline_ms = 0.0;
-        double input_to_result_ms = 0.0;
+    };
+
+    struct FrameTiming
+    {
+        double latest_frame_copy_ms = 0.0;
+        RecognitionTiming recognition;
+        double render_display_ms = 0.0;
+        double consumer_pipeline_ms = 0.0;
+    };
+
+    struct PerformanceStatistics
+    {
+        uint64_t processed_frames = 0;
+        uint64_t dropped_frames = 0;
+        RunningMetric latest_frame_copy_ms;
+        RunningMetric preprocess_ms;
+        RunningMetric input_copy_ms;
+        RunningMetric inference_call_ms;
+        RunningMetric host_to_device_ms;
+        RunningMetric model_inference_ms;
+        RunningMetric device_to_host_ms;
+        RunningMetric postprocess_ms;
+        RunningMetric recognition_pipeline_ms;
+        RunningMetric render_display_ms;
+        RunningMetric consumer_pipeline_ms;
+
+        void add(const FrameTiming &timing, uint64_t dropped)
+        {
+            ++processed_frames;
+            dropped_frames += dropped;
+            latest_frame_copy_ms.add(timing.latest_frame_copy_ms);
+            preprocess_ms.add(timing.recognition.preprocess_ms);
+            input_copy_ms.add(timing.recognition.input_copy_ms);
+            inference_call_ms.add(timing.recognition.inference_call_ms);
+            host_to_device_ms.add(timing.recognition.host_to_device_ms);
+            model_inference_ms.add(timing.recognition.model_inference_ms);
+            device_to_host_ms.add(timing.recognition.device_to_host_ms);
+            postprocess_ms.add(timing.recognition.postprocess_ms);
+            recognition_pipeline_ms.add(timing.recognition.recognition_pipeline_ms);
+            render_display_ms.add(timing.render_display_ms);
+            consumer_pipeline_ms.add(timing.consumer_pipeline_ms);
+        }
+    };
+
+    struct CaptureStatistics
+    {
+        uint64_t decoded_frames = 0;
+        RunningMetric read_ms;
+    };
+
+    struct CaptureInformation
+    {
+        std::string backend = "unknown";
+        bool used_automatic_fallback = false;
+        bool timeout_supported = AXCL_OPENCV_CAPTURE_TIMEOUT_SUPPORTED != 0;
+        double reported_fps = 0.0;
+    };
+
+    enum class FrameWaitStatus
+    {
+        frame_ready,
+        timeout,
+        stream_ended
     };
 
     double elapsed_ms(const Clock::time_point &start, const Clock::time_point &end)
@@ -105,196 +203,583 @@ namespace
         return std::chrono::duration<double, std::milli>(end - start).count();
     }
 
-    void print_recognition_timing(const RecognitionTiming &timing, bool success)
+    std::string path_for_log(const fs::path &path)
     {
-        fprintf(stdout, "识别耗时明细（AXCL 子项已包含在 AXCL 调用总耗时中）：\n");
-        fprintf(stdout, "  图片读取/解码：%8.3f ms\n", timing.image_load_ms);
-        fprintf(stdout, "  图像预处理：   %8.3f ms\n", timing.preprocess_ms);
-        fprintf(stdout, "  输入缓冲区复制：%8.3f ms\n", timing.input_copy_ms);
-        fprintf(stdout, "  AXCL 调用总耗时：%8.3f ms\n", timing.inference_call_ms);
-        fprintf(stdout, "    主机到设备（H2D）：%8.3f ms\n", timing.host_to_device_ms);
-        fprintf(stdout, "    模型推理：         %8.3f ms\n", timing.model_inference_ms);
-        fprintf(stdout, "    设备到主机（D2H）：%8.3f ms\n", timing.device_to_host_ms);
-        fprintf(stdout, "  后处理：       %8.3f ms\n", timing.postprocess_ms);
-        fprintf(stdout, "识别流程耗时（不含图片读取和输出处理）：%.3f ms\n", timing.recognition_pipeline_ms);
-        fprintf(stdout, "输入到结果耗时（不含绘制和保存）：%.3f ms\n", timing.input_to_result_ms);
-        fprintf(stdout, "识别状态：%s\n", success ? "成功" : "失败");
+        return path.u8string();
     }
 
-    void print_output_timing(const detection::DrawObjectsTiming &timing, bool success)
+    std::string source_for_log(const std::string &source)
     {
-        fprintf(stdout, "输出处理耗时（不计入识别耗时）：\n");
-        fprintf(stdout, "  结果绘制：%8.3f ms\n", timing.render_ms);
-        fprintf(stdout, "  结果保存：%8.3f ms\n", timing.save_ms);
-        fprintf(stdout, "输出状态：%s\n", success ? "成功" : "失败");
-    }
-
-    template<typename Timing>
-    void print_timing_statistics(const char *name, const std::vector<Timing> &timings, double Timing::*field)
-    {
-        double total = 0.0;
-        double minimum = timings.front().*field;
-        double maximum = minimum;
-        for (const auto &timing : timings)
+        const auto scheme_end = source.find("://");
+        if (scheme_end == std::string::npos)
         {
-            const double value = timing.*field;
-            total += value;
-            minimum = std::min(minimum, value);
-            maximum = std::max(maximum, value);
+            return source;
         }
 
-        fprintf(stdout, "  %s：平均 %8.3f ms，最小 %8.3f ms，最大 %8.3f ms\n", name,
-                total / static_cast<double>(timings.size()), minimum, maximum);
-    }
-
-    bool is_supported_image_file(const fs::path &file)
-    {
-        static const std::array<std::string, 7> SUPPORTED_EXTENSIONS = {
-            ".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"};
-
-        auto extension = file.extension().string();
-        std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char value)
+        const size_t credentials_start = scheme_end + 3;
+        const auto at = source.find('@', credentials_start);
+        if (at == std::string::npos)
         {
-            return static_cast<char>(std::tolower(value));
-        });
-
-        return std::find(SUPPORTED_EXTENSIONS.begin(), SUPPORTED_EXTENSIONS.end(), extension) != SUPPORTED_EXTENSIONS.end();
-    }
-
-    bool collect_image_files(const fs::path &input_dir, std::vector<fs::path> &image_files)
-    {
-        std::error_code error;
-        fs::directory_iterator iterator(input_dir, error);
-        if (error)
-        {
-            fprintf(stderr, "Open input directory failed: %s (%s)\n", path_for_log(input_dir).c_str(), error.message().c_str());
-            return false;
+            return source;
         }
 
-        const fs::directory_iterator end;
-        while (iterator != end)
+        const auto password_separator = source.find(':', credentials_start);
+        if (password_separator != std::string::npos && password_separator < at)
         {
-            std::error_code type_error;
-            if (iterator->is_regular_file(type_error) && is_supported_image_file(iterator->path()))
-            {
-                image_files.push_back(iterator->path());
-            }
-            else if (type_error)
-            {
-                fprintf(stderr, "Read directory entry failed: %s (%s)\n", path_for_log(iterator->path()).c_str(), type_error.message().c_str());
-            }
-
-            iterator.increment(error);
-            if (error)
-            {
-                fprintf(stderr, "Scan input directory failed: %s (%s)\n", path_for_log(input_dir).c_str(), error.message().c_str());
-                return false;
-            }
+            return source.substr(0, password_separator + 1) + "***" + source.substr(at);
         }
 
-        std::sort(image_files.begin(), image_files.end(), [](const fs::path &left, const fs::path &right)
-        {
-            return left.filename().native() < right.filename().native();
-        });
-        return true;
+        return source.substr(0, credentials_start) + "***" + source.substr(at);
     }
 
-    bool load_image(const fs::path &image_file, cv::Mat &mat, bool report_error)
+    class LatestFrameCapture
     {
-        mat = cv::imread(image_file.string(), cv::IMREAD_COLOR);
-        if (mat.empty())
+    public:
+        LatestFrameCapture() = default;
+        LatestFrameCapture(const LatestFrameCapture &) = delete;
+        LatestFrameCapture &operator=(const LatestFrameCapture &) = delete;
+
+        ~LatestFrameCapture()
         {
-            if (report_error)
-            {
-                fprintf(stderr, "Read image failed: %s\n", path_for_log(image_file).c_str());
-            }
-            return false;
+            stop();
         }
-        return true;
-    }
 
-    bool prepare_warmup_data(const std::vector<fs::path> &image_files, std::vector<uint8_t> &data,
-                             int input_h, int input_w)
-    {
-        cv::Mat mat;
-        for (const auto &image_file : image_files)
+        bool start(const std::string &source)
         {
             try
             {
-                if (load_image(image_file, mat, false))
+                worker_ = std::thread(&LatestFrameCapture::capture_loop, this, source);
+            }
+            catch (const std::exception &exception)
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                error_message_ = std::string("Start capture thread failed: ") + exception.what();
+                return false;
+            }
+
+            std::unique_lock<std::mutex> lock(mutex_);
+            condition_.wait(lock, [this]()
+            {
+                return open_complete_;
+            });
+            const bool success = open_success_;
+            lock.unlock();
+
+            if (!success && worker_.joinable())
+            {
+                worker_.join();
+            }
+            return success;
+        }
+
+        bool wait_for_first_frame(cv::Mat &frame)
+        {
+            uint64_t sequence = 0;
+            double copy_ms = 0.0;
+            while (true)
+            {
+                const auto status = wait_for_new_frame(0, frame, sequence, copy_ms, std::chrono::milliseconds(100));
+                if (status == FrameWaitStatus::frame_ready)
                 {
-                    common::get_input_data_letterbox(mat, data, input_h, input_w);
                     return true;
                 }
-            }
-            catch (const std::exception &)
-            {
+                if (status == FrameWaitStatus::stream_ended)
+                {
+                    return false;
+                }
             }
         }
 
-        return false;
+        FrameWaitStatus wait_for_new_frame(uint64_t last_sequence, cv::Mat &frame, uint64_t &sequence,
+                                           double &copy_ms, std::chrono::milliseconds timeout)
+        {
+            cv::Mat shared_frame;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                const bool ready = condition_.wait_for(lock, timeout, [this, last_sequence]()
+                {
+                    return sequence_ > last_sequence || stream_failed_ || worker_done_ || stop_requested_.load();
+                });
+                if (!ready)
+                {
+                    return FrameWaitStatus::timeout;
+                }
+                if (stream_failed_ || stop_requested_.load())
+                {
+                    return FrameWaitStatus::stream_ended;
+                }
+                if (sequence_ <= last_sequence)
+                {
+                    return FrameWaitStatus::stream_ended;
+                }
+
+                shared_frame = latest_frame_;
+                sequence = sequence_;
+            }
+
+            const auto copy_start = Clock::now();
+            shared_frame.copyTo(frame);
+            copy_ms = elapsed_ms(copy_start, Clock::now());
+            return frame.empty() ? FrameWaitStatus::stream_ended : FrameWaitStatus::frame_ready;
+        }
+
+        uint64_t begin_statistics()
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            interval_statistics_ = CaptureStatistics{};
+            total_statistics_ = CaptureStatistics{};
+            return sequence_;
+        }
+
+        CaptureStatistics take_interval_statistics()
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            const CaptureStatistics result = interval_statistics_;
+            interval_statistics_ = CaptureStatistics{};
+            return result;
+        }
+
+        CaptureStatistics total_statistics() const
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return total_statistics_;
+        }
+
+        CaptureInformation information() const
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return information_;
+        }
+
+        std::string error_message() const
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return error_message_;
+        }
+
+        void stop()
+        {
+            stop_requested_.store(true);
+            condition_.notify_all();
+            if (worker_.joinable())
+            {
+                worker_.join();
+            }
+        }
+
+    private:
+        void report_failure(const std::string &message)
+        {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                error_message_ = message;
+                stream_failed_ = true;
+                worker_done_ = true;
+                if (!open_complete_)
+                {
+                    open_complete_ = true;
+                    open_success_ = false;
+                }
+            }
+            condition_.notify_all();
+        }
+
+        void capture_loop(const std::string &source)
+        {
+            cv::VideoCapture capture;
+            bool opened_with_ffmpeg = false;
+            try
+            {
+#if AXCL_OPENCV_CAPTURE_TIMEOUT_SUPPORTED
+                const std::vector<int> timeout_parameters = {
+                    cv::CAP_PROP_OPEN_TIMEOUT_MSEC, CAPTURE_TIMEOUT_MS,
+                    cv::CAP_PROP_READ_TIMEOUT_MSEC, CAPTURE_TIMEOUT_MS};
+#endif
+                const auto try_open = [&](int backend)
+                {
+                    try
+                    {
+#if AXCL_OPENCV_CAPTURE_TIMEOUT_SUPPORTED
+                        return capture.open(source, backend, timeout_parameters);
+#else
+                        return capture.open(source, backend);
+#endif
+                    }
+                    catch (const cv::Exception &)
+                    {
+                        capture.release();
+                        return false;
+                    }
+                };
+
+                opened_with_ffmpeg = try_open(cv::CAP_FFMPEG);
+                if (!opened_with_ffmpeg)
+                {
+                    capture.release();
+                    if (!try_open(cv::CAP_ANY))
+                    {
+                        report_failure("Open RTSP source failed with FFmpeg and automatic OpenCV backends.");
+                        return;
+                    }
+                }
+
+                capture.set(cv::CAP_PROP_BUFFERSIZE, 1.0);
+
+                CaptureInformation information;
+                information.used_automatic_fallback = !opened_with_ffmpeg;
+                information.reported_fps = capture.get(cv::CAP_PROP_FPS);
+                try
+                {
+                    information.backend = capture.getBackendName();
+                }
+                catch (const cv::Exception &)
+                {
+                    information.backend = opened_with_ffmpeg ? "FFMPEG" : "unknown";
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    information_ = std::move(information);
+                    open_success_ = true;
+                    open_complete_ = true;
+                }
+                condition_.notify_all();
+
+                while (!stop_requested_.load())
+                {
+                    cv::Mat frame;
+                    const auto read_start = Clock::now();
+                    const bool read_success = capture.read(frame);
+                    const double read_ms = elapsed_ms(read_start, Clock::now());
+
+                    if (stop_requested_.load())
+                    {
+                        break;
+                    }
+                    if (!read_success || frame.empty())
+                    {
+                        report_failure("RTSP frame read/decode failed.");
+                        capture.release();
+                        return;
+                    }
+
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        latest_frame_ = std::move(frame);
+                        ++sequence_;
+                        ++interval_statistics_.decoded_frames;
+                        interval_statistics_.read_ms.add(read_ms);
+                        ++total_statistics_.decoded_frames;
+                        total_statistics_.read_ms.add(read_ms);
+                    }
+                    condition_.notify_all();
+                }
+            }
+            catch (const cv::Exception &exception)
+            {
+                report_failure(std::string("OpenCV capture failed: ") + exception.what());
+                return;
+            }
+            catch (const std::exception &exception)
+            {
+                report_failure(std::string("RTSP capture failed: ") + exception.what());
+                return;
+            }
+
+            capture.release();
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                worker_done_ = true;
+            }
+            condition_.notify_all();
+        }
+
+        mutable std::mutex mutex_;
+        std::condition_variable condition_;
+        std::thread worker_;
+        std::atomic<bool> stop_requested_{false};
+        cv::Mat latest_frame_;
+        uint64_t sequence_ = 0;
+        bool open_complete_ = false;
+        bool open_success_ = false;
+        bool stream_failed_ = false;
+        bool worker_done_ = false;
+        std::string error_message_;
+        CaptureInformation information_;
+        CaptureStatistics interval_statistics_;
+        CaptureStatistics total_statistics_;
+    };
+
+    cv::Size preview_size_for(const cv::Mat &frame)
+    {
+        if (frame.empty())
+        {
+            return {PREVIEW_MAX_WIDTH, PREVIEW_MAX_HEIGHT};
+        }
+
+        const double width_scale = static_cast<double>(PREVIEW_MAX_WIDTH) / static_cast<double>(frame.cols);
+        const double height_scale = static_cast<double>(PREVIEW_MAX_HEIGHT) / static_cast<double>(frame.rows);
+        const double scale = std::min({1.0, width_scale, height_scale});
+        return {
+            std::max(1, static_cast<int>(std::lround(frame.cols * scale))),
+            std::max(1, static_cast<int>(std::lround(frame.rows * scale)))};
+    }
+
+    cv::Scalar color_for_label(int label)
+    {
+        static const std::array<cv::Scalar, 8> COLORS = {
+            cv::Scalar(255, 178, 50), cv::Scalar(50, 205, 50), cv::Scalar(255, 90, 90), cv::Scalar(255, 200, 80),
+            cv::Scalar(180, 105, 255), cv::Scalar(80, 220, 220), cv::Scalar(220, 160, 80), cv::Scalar(130, 130, 255)};
+        const size_t index = label < 0 ? 0 : static_cast<size_t>(label) % COLORS.size();
+        return COLORS[index];
+    }
+
+    cv::Mat render_result(const cv::Mat &frame, const std::vector<detection::Object> &objects,
+                          double actual_fps, double maximum_fps)
+    {
+        const cv::Size preview_size = preview_size_for(frame);
+        cv::Mat preview;
+        if (preview_size.width != frame.cols || preview_size.height != frame.rows)
+        {
+            cv::resize(frame, preview, preview_size, 0.0, 0.0, cv::INTER_LINEAR);
+        }
+        else
+        {
+            preview = frame.clone();
+        }
+
+        const double scale_x = static_cast<double>(preview.cols) / static_cast<double>(frame.cols);
+        const double scale_y = static_cast<double>(preview.rows) / static_cast<double>(frame.rows);
+        const double font_scale = std::max(0.45, 0.65 * static_cast<double>(preview.cols) / PREVIEW_MAX_WIDTH);
+        constexpr int thickness = 2;
+
+        for (const auto &object : objects)
+        {
+            const int left = std::clamp(static_cast<int>(std::lround(object.rect.x * scale_x)), 0, preview.cols - 1);
+            const int top = std::clamp(static_cast<int>(std::lround(object.rect.y * scale_y)), 0, preview.rows - 1);
+            const int right = std::clamp(static_cast<int>(std::lround((object.rect.x + object.rect.width) * scale_x)),
+                                         0, preview.cols - 1);
+            const int bottom = std::clamp(static_cast<int>(std::lround((object.rect.y + object.rect.height) * scale_y)),
+                                          0, preview.rows - 1);
+            if (right <= left || bottom <= top)
+            {
+                continue;
+            }
+
+            const cv::Scalar color = color_for_label(object.label);
+            cv::rectangle(preview, cv::Rect(left, top, right - left, bottom - top), color, thickness);
+
+            const char *class_name = object.label >= 0 && object.label < NUM_CLASS ? CLASS_NAMES[object.label] : "unknown";
+            char label_text[128];
+            std::snprintf(label_text, sizeof(label_text), "%s %.1f%%", class_name, object.prob * 100.0f);
+            int baseline = 0;
+            const cv::Size text_size = cv::getTextSize(label_text, cv::FONT_HERSHEY_SIMPLEX,
+                                                       font_scale, 1, &baseline);
+            const int text_x = std::clamp(left, 0, std::max(0, preview.cols - text_size.width));
+            const int text_y = std::max(0, top - text_size.height - baseline - 4);
+            cv::rectangle(preview,
+                          cv::Rect(text_x, text_y,
+                                   std::min(text_size.width + 4, preview.cols - text_x),
+                                   std::min(text_size.height + baseline + 4, preview.rows - text_y)),
+                          color, cv::FILLED);
+            cv::putText(preview, label_text, cv::Point(text_x + 2, text_y + text_size.height + 1),
+                        cv::FONT_HERSHEY_SIMPLEX, font_scale, cv::Scalar(0, 0, 0), 1, cv::LINE_AA);
+        }
+
+        char performance_text[128];
+        std::snprintf(performance_text, sizeof(performance_text), "FPS: %.1f | MAX: %.1f", actual_fps, maximum_fps);
+        int baseline = 0;
+        const cv::Size text_size = cv::getTextSize(performance_text, cv::FONT_HERSHEY_SIMPLEX, 0.75, 2, &baseline);
+        const int panel_width = std::min(preview.cols, text_size.width + 20);
+        const int panel_height = std::min(preview.rows, text_size.height + baseline + 20);
+        cv::rectangle(preview, cv::Rect(0, 0, panel_width, panel_height), cv::Scalar(0, 0, 0), cv::FILLED);
+        cv::putText(preview, performance_text, cv::Point(10, std::min(preview.rows - 1, text_size.height + 8)),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.75, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+        return preview;
+    }
+
+    bool window_is_closed()
+    {
+        try
+        {
+            return cv::getWindowProperty(WINDOW_NAME, cv::WND_PROP_VISIBLE) < 1.0;
+        }
+        catch (const cv::Exception &)
+        {
+            return true;
+        }
+    }
+
+    double frames_per_second(uint64_t frames, double duration_seconds)
+    {
+        return duration_seconds > 0.0 ? static_cast<double>(frames) / duration_seconds : 0.0;
+    }
+
+    double maximum_fps(const RunningMetric &milliseconds)
+    {
+        const double average = milliseconds.average();
+        return average > 0.0 ? 1000.0 / average : 0.0;
+    }
+
+    const char *suspected_bottleneck(const PerformanceStatistics &performance, double capture_fps,
+                                     double pipeline_max_fps)
+    {
+        if (performance.processed_frames == 0)
+        {
+            return "暂无识别样本";
+        }
+        if (capture_fps <= 0.0)
+        {
+            return "取流/解码/网络";
+        }
+        if (pipeline_max_fps < capture_fps * 0.90)
+        {
+            const double npu_ms = performance.model_inference_ms.average();
+            const double non_npu_ms = std::max(0.0, performance.consumer_pipeline_ms.average() - npu_ms);
+            return npu_ms >= non_npu_ms ? "NPU 模型执行" : "CPU 处理、传输或显示";
+        }
+        if (capture_fps < pipeline_max_fps * 0.90)
+        {
+            return "取流/解码/网络或摄像头帧率上限";
+        }
+        return "取流与识别吞吐接近";
+    }
+
+    void print_interval_statistics(const PerformanceStatistics &performance,
+                                   const CaptureStatistics &capture, double duration_seconds,
+                                   double &actual_fps, double &pipeline_max_fps)
+    {
+        actual_fps = frames_per_second(performance.processed_frames, duration_seconds);
+        const double capture_fps = frames_per_second(capture.decoded_frames, duration_seconds);
+        pipeline_max_fps = maximum_fps(performance.consumer_pipeline_ms);
+        const double npu_max_fps = maximum_fps(performance.model_inference_ms);
+
+        fprintf(stdout, "\n[最近 %.2f 秒] 实际 FPS %.2f | MAX %.2f | NPU MAX %.2f | 丢弃 %llu 帧\n",
+                duration_seconds, actual_fps, pipeline_max_fps, npu_max_fps,
+                static_cast<unsigned long long>(performance.dropped_frames));
+        fprintf(stdout, "  取流/网络等待/CPU 解码：%.2f FPS，平均 %.3f ms/帧\n",
+                capture_fps, capture.read_ms.average());
+        fprintf(stdout, "  最新帧复制：            %8.3f ms\n", performance.latest_frame_copy_ms.average());
+        fprintf(stdout, "  图像预处理：            %8.3f ms\n", performance.preprocess_ms.average());
+        fprintf(stdout, "  输入缓冲区复制：        %8.3f ms\n", performance.input_copy_ms.average());
+        fprintf(stdout, "  AXCL 调用总耗时：       %8.3f ms（包含以下 H2D、NPU、D2H）\n",
+                performance.inference_call_ms.average());
+        fprintf(stdout, "    主机到设备（H2D）：   %8.3f ms\n", performance.host_to_device_ms.average());
+        fprintf(stdout, "    NPU 模型执行：        %8.3f ms\n", performance.model_inference_ms.average());
+        fprintf(stdout, "    设备到主机（D2H）：   %8.3f ms\n", performance.device_to_host_ms.average());
+        fprintf(stdout, "  后处理：                %8.3f ms\n", performance.postprocess_ms.average());
+        fprintf(stdout, "  识别流水线：            %8.3f ms\n", performance.recognition_pipeline_ms.average());
+        fprintf(stdout, "  绘制与显示：            %8.3f ms\n", performance.render_display_ms.average());
+        fprintf(stdout, "  完整消费端流水线：      %8.3f ms\n", performance.consumer_pipeline_ms.average());
+        fprintf(stdout, "  疑似瓶颈：%s（启发式判断）\n",
+                suspected_bottleneck(performance, capture_fps, pipeline_max_fps));
+        fflush(stdout);
+    }
+
+    void print_metric_summary(const char *name, const RunningMetric &metric)
+    {
+        if (metric.count == 0)
+        {
+            fprintf(stdout, "  %-24s 无样本\n", name);
+            return;
+        }
+        fprintf(stdout, "  %-24s 平均 %8.3f ms，最小 %8.3f ms，最大 %8.3f ms\n",
+                name, metric.average(), metric.minimum, metric.maximum);
+    }
+
+    void print_final_statistics(const PerformanceStatistics &performance,
+                                const CaptureStatistics &capture, double duration_seconds)
+    {
+        fprintf(stdout, "\n--------------------------------------\n");
+        fprintf(stdout, "实时识别汇总：运行 %.2f 秒，识别 %llu 帧，丢弃 %llu 帧\n",
+                duration_seconds,
+                static_cast<unsigned long long>(performance.processed_frames),
+                static_cast<unsigned long long>(performance.dropped_frames));
+        fprintf(stdout, "平均实际 FPS：%.2f，平均 MAX：%.2f，平均 NPU MAX：%.2f\n",
+                frames_per_second(performance.processed_frames, duration_seconds),
+                maximum_fps(performance.consumer_pipeline_ms),
+                maximum_fps(performance.model_inference_ms));
+        fprintf(stdout, "取流/网络等待/CPU 解码：%.2f FPS\n",
+                frames_per_second(capture.decoded_frames, duration_seconds));
+        print_metric_summary("取流/解码调用", capture.read_ms);
+        print_metric_summary("最新帧复制", performance.latest_frame_copy_ms);
+        print_metric_summary("图像预处理", performance.preprocess_ms);
+        print_metric_summary("输入缓冲区复制", performance.input_copy_ms);
+        print_metric_summary("AXCL 调用总耗时", performance.inference_call_ms);
+        print_metric_summary("主机到设备（H2D）", performance.host_to_device_ms);
+        print_metric_summary("NPU 模型执行", performance.model_inference_ms);
+        print_metric_summary("设备到主机（D2H）", performance.device_to_host_ms);
+        print_metric_summary("后处理", performance.postprocess_ms);
+        print_metric_summary("识别流水线", performance.recognition_pipeline_ms);
+        print_metric_summary("绘制与显示", performance.render_display_ms);
+        print_metric_summary("完整消费端流水线", performance.consumer_pipeline_ms);
+        fprintf(stdout, "--------------------------------------\n");
+    }
+
+    bool prepare_warmup_data(const cv::Mat &frame, std::vector<uint8_t> &data, int input_h, int input_w)
+    {
+        if (frame.empty())
+        {
+            return false;
+        }
+
+        try
+        {
+            common::get_input_data_letterbox(frame, data, input_h, input_w);
+            return true;
+        }
+        catch (const std::exception &exception)
+        {
+            fprintf(stderr, "Prepare warm-up frame failed: %s\n", exception.what());
+            return false;
+        }
     }
 } // namespace
 
 namespace ax
 {
-    bool post_process(const ax_runner_tensor_t *output, const int nOutputSize, const cv::Mat &mat,
+    bool post_process(const ax_runner_tensor_t *output, int output_count, const cv::Mat &frame,
                       int input_w, int input_h, std::vector<detection::Object> &objects)
     {
-        if (nOutputSize < 6)
+        if (output_count < 6)
         {
-            fprintf(stderr, "Unexpected model output count: %d, expected at least 6.\n", nOutputSize);
+            fprintf(stderr, "Unexpected model output count: %d, expected at least 6.\n", output_count);
             return false;
         }
 
         std::vector<detection::Object> proposals;
+        float *output_ptr[3] = {
+            static_cast<float *>(output[0].pVirAddr),
+            static_cast<float *>(output[2].pVirAddr),
+            static_cast<float *>(output[4].pVirAddr)};
+        float *output_class_ptr[3] = {
+            static_cast<float *>(output[1].pVirAddr),
+            static_cast<float *>(output[3].pVirAddr),
+            static_cast<float *>(output[5].pVirAddr)};
 
-        float* output_ptr[3] = {(float*)output[0].pVirAddr,      // 1*80*80*4
-                                (float*)output[2].pVirAddr,      // 1*40*40*4
-                                (float*)output[4].pVirAddr};     // 1*20*20*4
-        float* output_cls_ptr[3] = {(float*)output[1].pVirAddr,  // 1*80*80*80
-                                    (float*)output[3].pVirAddr,  // 1*40*40*80
-                                    (float*)output[5].pVirAddr}; // 1*20*20*80
         for (int i = 0; i < 3; ++i)
         {
-            auto feat_ptr = output_ptr[i];
-            auto feat_cls_ptr = output_cls_ptr[i];
-            int32_t stride = (1 << i) * 8;
-            detection::generate_proposals_yolo26(stride, feat_ptr, feat_cls_ptr, PROB_THRESHOLD, proposals, input_w, input_h, NUM_CLASS);
+            const int32_t stride = (1 << i) * 8;
+            detection::generate_proposals_yolo26(stride, output_ptr[i], output_class_ptr[i],
+                                                 PROB_THRESHOLD, proposals, input_w, input_h, NUM_CLASS);
         }
 
-        detection::get_out_bbox(proposals, objects, NMS_THRESHOLD, input_h, input_w, mat.rows, mat.cols);
+        detection::get_out_bbox(proposals, objects, NMS_THRESHOLD, input_h, input_w, frame.rows, frame.cols);
         return true;
     }
 
-    bool recognize_image(ax_runner_axcl &runner, const fs::path &image_file, cv::Mat &mat,
+    bool recognize_frame(ax_runner_axcl &runner, const cv::Mat &frame,
                          std::vector<detection::Object> &objects, std::vector<uint8_t> &data,
                          int input_h, int input_w, RecognitionTiming &timing)
     {
-        const auto input_start = Clock::now();
-        const auto load_start = Clock::now();
-        const bool load_success = load_image(image_file, mat, true);
-        timing.image_load_ms = elapsed_ms(load_start, Clock::now());
-        if (!load_success)
-        {
-            timing.input_to_result_ms = elapsed_ms(input_start, Clock::now());
-            return false;
-        }
-
         const auto recognition_start = Clock::now();
-        const auto finish_recognition_timing = [&]()
-        {
-            const auto recognition_end = Clock::now();
-            timing.recognition_pipeline_ms = elapsed_ms(recognition_start, recognition_end);
-            timing.input_to_result_ms = elapsed_ms(input_start, recognition_end);
-        };
 
         const auto preprocess_start = Clock::now();
-        common::get_input_data_letterbox(mat, data, input_h, input_w);
+        common::get_input_data_letterbox(frame, data, input_h, input_w);
         timing.preprocess_ms = elapsed_ms(preprocess_start, Clock::now());
 
         const auto input_copy_start = Clock::now();
-        memcpy(runner.get_input(0).pVirAddr, data.data(), data.size());
+        std::memcpy(runner.get_input(0).pVirAddr, data.data(), data.size());
         timing.input_copy_ms = elapsed_ms(input_copy_start, Clock::now());
 
         const auto inference_start = Clock::now();
@@ -302,8 +787,8 @@ namespace ax
         timing.inference_call_ms = elapsed_ms(inference_start, Clock::now());
         if (ret != 0)
         {
-            finish_recognition_timing();
-            fprintf(stderr, "Inference failed for %s, ret=0x%x.\n", path_for_log(image_file).c_str(), ret);
+            timing.recognition_pipeline_ms = elapsed_ms(recognition_start, Clock::now());
+            fprintf(stderr, "Inference failed, ret=0x%x.\n", ret);
             return false;
         }
         timing.host_to_device_ms = runner.cost_host_to_device;
@@ -311,26 +796,32 @@ namespace ax
         timing.device_to_host_ms = runner.cost_device_to_host;
 
         const auto postprocess_start = Clock::now();
-        const bool postprocess_success = post_process(runner.get_outputs_ptr(0), runner.get_num_outputs(), mat,
-                                                      input_w, input_h, objects);
+        const bool postprocess_success = post_process(runner.get_outputs_ptr(0), runner.get_num_outputs(),
+                                                      frame, input_w, input_h, objects);
         timing.postprocess_ms = elapsed_ms(postprocess_start, Clock::now());
-        finish_recognition_timing();
-        if (!postprocess_success)
-        {
-            return false;
-        }
-
-        return true;
+        timing.recognition_pipeline_ms = elapsed_ms(recognition_start, Clock::now());
+        return postprocess_success;
     }
 
-    bool run_model(const std::string &model, const std::vector<fs::path> &image_files, const fs::path &output_dir,
-                   const std::vector<uint8_t> &warmup_data, int input_h, int input_w)
+    bool run_model(const std::string &model, LatestFrameCapture &capture,
+                   const std::vector<uint8_t> &warmup_data, const cv::Mat &first_frame,
+                   int input_h, int input_w)
     {
+        struct CaptureStopGuard
+        {
+            LatestFrameCapture &capture;
+
+            ~CaptureStopGuard()
+            {
+                capture.stop();
+            }
+        } capture_stop_guard{capture};
+
         ax_runner_axcl runner;
         int ret = runner.init(model.c_str());
         if (ret != 0)
         {
-            fprintf(stderr, "init ax model runner failed.\n");
+            fprintf(stderr, "Init AX model runner failed.\n");
             return false;
         }
 
@@ -344,12 +835,13 @@ namespace ax
         const int model_input_size = runner.get_input(0).nSize;
         if (model_input_size <= 0 || static_cast<size_t>(model_input_size) != warmup_data.size())
         {
-            fprintf(stderr, "Model input size mismatch: model=%d, image=%zu.\n", model_input_size, warmup_data.size());
+            fprintf(stderr, "Model input size mismatch: model=%d, frame=%zu.\n",
+                    model_input_size, warmup_data.size());
             runner.release();
             return false;
         }
 
-        memcpy(runner.get_input(0).pVirAddr, warmup_data.data(), warmup_data.size());
+        std::memcpy(runner.get_input(0).pVirAddr, warmup_data.data(), warmup_data.size());
         fprintf(stdout, "Warm up %d times...\n", WARMUP_COUNT);
         for (int i = 0; i < WARMUP_COUNT; ++i)
         {
@@ -363,101 +855,125 @@ namespace ax
         }
 
         std::vector<uint8_t> data(warmup_data.size(), 0);
-        std::vector<RecognitionTiming> recognition_time_costs;
-        std::vector<detection::DrawObjectsTiming> output_time_costs;
-        size_t recognition_failed_count = 0;
-        size_t output_failed_count = 0;
+        PerformanceStatistics interval_statistics;
+        PerformanceStatistics total_statistics;
+        uint64_t last_sequence = capture.begin_statistics();
+        double display_actual_fps = 0.0;
+        double display_maximum_fps = 0.0;
+        bool failed = false;
+        bool user_requested_exit = false;
 
-        for (size_t i = 0; i < image_files.size(); ++i)
+        try
         {
-            const auto &image_file = image_files[i];
-            const fs::path output_file = output_dir / image_file.filename();
-            fprintf(stdout, "\n[%zu/%zu] 图片：%s\n", i + 1, image_files.size(), path_for_log(image_file).c_str());
+            cv::namedWindow(WINDOW_NAME, cv::WINDOW_NORMAL | cv::WINDOW_KEEPRATIO);
+            const cv::Size initial_preview_size = preview_size_for(first_frame);
+            cv::resizeWindow(WINDOW_NAME, initial_preview_size.width, initial_preview_size.height);
+        }
+        catch (const cv::Exception &exception)
+        {
+            fprintf(stderr, "Create OpenCV preview window failed: %s\n", exception.what());
+            runner.release();
+            return false;
+        }
 
-            RecognitionTiming timing;
-            cv::Mat mat;
-            std::vector<detection::Object> objects;
-            bool recognition_success = false;
-            try
+        const auto benchmark_start = Clock::now();
+        auto interval_start = benchmark_start;
+
+        while (!failed && !user_requested_exit)
+        {
+            cv::Mat frame;
+            uint64_t sequence = last_sequence;
+            double latest_frame_copy_ms = 0.0;
+            const auto wait_status = capture.wait_for_new_frame(last_sequence, frame, sequence,
+                                                                 latest_frame_copy_ms,
+                                                                 std::chrono::milliseconds(10));
+            if (wait_status == FrameWaitStatus::stream_ended)
             {
-                recognition_success = recognize_image(runner, image_file, mat, objects, data,
-                                                      input_h, input_w, timing);
+                fprintf(stderr, "RTSP stream ended: %s\n", capture.error_message().c_str());
+                failed = true;
+                break;
             }
-            catch (const std::exception &exception)
-            {
-                fprintf(stderr, "Recognize image failed: %s (%s)\n", path_for_log(image_file).c_str(), exception.what());
-            }
 
-            print_recognition_timing(timing, recognition_success);
-            if (!recognition_success)
+            if (wait_status == FrameWaitStatus::timeout)
             {
-                ++recognition_failed_count;
-                fprintf(stdout, "输出处理：未执行（识别失败）\n");
-                continue;
-            }
-
-            recognition_time_costs.push_back(timing);
-            fprintf(stdout, "检测目标数：%zu\n", objects.size());
-
-            detection::DrawObjectsTiming output_timing;
-            bool output_success = false;
-            try
-            {
-                const auto output_path = output_file.string();
-                output_success = detection::draw_objects(mat, objects, CLASS_NAMES, output_path.c_str(),
-                                                         0.5, 1, false, &output_timing);
-                if (!output_success)
+                const int key = cv::waitKey(1) & 0xff;
+                if (key == 'q' || key == 'Q' || key == 27 || window_is_closed())
                 {
-                    fprintf(stderr, "Write result failed: %s\n", path_for_log(output_file).c_str());
+                    user_requested_exit = true;
                 }
-            }
-            catch (const std::exception &exception)
-            {
-                fprintf(stderr, "Write result failed: %s (%s)\n", path_for_log(output_file).c_str(), exception.what());
-            }
-
-            print_output_timing(output_timing, output_success);
-            if (output_success)
-            {
-                output_time_costs.push_back(output_timing);
-                fprintf(stdout, "结果文件：%s\n", path_for_log(output_file).c_str());
             }
             else
             {
-                ++output_failed_count;
+                const uint64_t dropped = sequence > last_sequence + 1 ? sequence - last_sequence - 1 : 0;
+                last_sequence = sequence;
+
+                FrameTiming timing;
+                timing.latest_frame_copy_ms = latest_frame_copy_ms;
+                const auto consumer_start = Clock::now();
+                std::vector<detection::Object> objects;
+
+                try
+                {
+                    if (!recognize_frame(runner, frame, objects, data, input_h, input_w, timing.recognition))
+                    {
+                        failed = true;
+                        break;
+                    }
+
+                    const auto render_start = Clock::now();
+                    cv::Mat preview = render_result(frame, objects, display_actual_fps, display_maximum_fps);
+                    cv::imshow(WINDOW_NAME, preview);
+                    const int key = cv::waitKey(1) & 0xff;
+                    timing.render_display_ms = elapsed_ms(render_start, Clock::now());
+                    timing.consumer_pipeline_ms = timing.latest_frame_copy_ms + elapsed_ms(consumer_start, Clock::now());
+
+                    interval_statistics.add(timing, dropped);
+                    total_statistics.add(timing, dropped);
+
+                    if (key == 'q' || key == 'Q' || key == 27 || window_is_closed())
+                    {
+                        user_requested_exit = true;
+                    }
+                }
+                catch (const cv::Exception &exception)
+                {
+                    fprintf(stderr, "OpenCV frame processing/display failed: %s\n", exception.what());
+                    failed = true;
+                }
+                catch (const std::exception &exception)
+                {
+                    fprintf(stderr, "Frame recognition failed: %s\n", exception.what());
+                    failed = true;
+                }
+            }
+
+            const auto now = Clock::now();
+            const double interval_seconds = elapsed_ms(interval_start, now) / 1000.0;
+            if (interval_seconds >= 1.0)
+            {
+                const CaptureStatistics capture_interval = capture.take_interval_statistics();
+                print_interval_statistics(interval_statistics, capture_interval, interval_seconds,
+                                          display_actual_fps, display_maximum_fps);
+                interval_statistics = PerformanceStatistics{};
+                interval_start = now;
             }
         }
 
-        fprintf(stdout, "\n--------------------------------------\n");
-        fprintf(stdout, "批处理汇总：识别成功 %zu，识别失败 %zu，输出成功 %zu，输出失败 %zu\n",
-                recognition_time_costs.size(), recognition_failed_count,
-                output_time_costs.size(), output_failed_count);
-        if (!recognition_time_costs.empty())
+        const auto benchmark_end = Clock::now();
+        const CaptureStatistics capture_total = capture.total_statistics();
+        capture.stop();
+        try
         {
-            fprintf(stdout, "识别耗时统计（仅统计识别成功的图片；AXCL 子项已包含在 AXCL 调用总耗时中）：\n");
-            print_timing_statistics("图片读取/解码", recognition_time_costs, &RecognitionTiming::image_load_ms);
-            print_timing_statistics("图像预处理", recognition_time_costs, &RecognitionTiming::preprocess_ms);
-            print_timing_statistics("输入缓冲区复制", recognition_time_costs, &RecognitionTiming::input_copy_ms);
-            print_timing_statistics("AXCL 调用总耗时", recognition_time_costs, &RecognitionTiming::inference_call_ms);
-            print_timing_statistics("  主机到设备（H2D）", recognition_time_costs, &RecognitionTiming::host_to_device_ms);
-            print_timing_statistics("  模型推理", recognition_time_costs, &RecognitionTiming::model_inference_ms);
-            print_timing_statistics("  设备到主机（D2H）", recognition_time_costs, &RecognitionTiming::device_to_host_ms);
-            print_timing_statistics("后处理", recognition_time_costs, &RecognitionTiming::postprocess_ms);
-            print_timing_statistics("识别流程耗时（不含图片读取和输出处理）", recognition_time_costs,
-                                    &RecognitionTiming::recognition_pipeline_ms);
-            print_timing_statistics("输入到结果耗时（不含绘制和保存）", recognition_time_costs,
-                                    &RecognitionTiming::input_to_result_ms);
+            cv::destroyWindow(WINDOW_NAME);
         }
-        if (!output_time_costs.empty())
+        catch (const cv::Exception &)
         {
-            fprintf(stdout, "输出处理耗时统计（仅统计输出成功的图片，不计入识别耗时）：\n");
-            print_timing_statistics("结果绘制", output_time_costs, &detection::DrawObjectsTiming::render_ms);
-            print_timing_statistics("结果保存", output_time_costs, &detection::DrawObjectsTiming::save_ms);
         }
-        fprintf(stdout, "--------------------------------------\n");
 
+        print_final_statistics(total_statistics, capture_total,
+                               elapsed_ms(benchmark_start, benchmark_end) / 1000.0);
         runner.release();
-        return recognition_failed_count == 0 && output_failed_count == 0 && !recognition_time_costs.empty();
+        return !failed && total_statistics.processed_frames > 0;
     }
 } // namespace ax
 
@@ -469,65 +985,26 @@ int main(int argc, char *argv[])
 
     cmdline::parser cmd;
     cmd.add<std::string>("model", 'm', "joint file(a.k.a. joint model)", false, DEFAULT_MODEL_FILE);
-    cmd.add<std::string>("input-dir", 'i', "input image directory", false, DEFAULT_INPUT_DIR);
-    cmd.add<std::string>("size", 'g', "input_h, input_w", false, std::to_string(DEFAULT_IMG_H) + "," + std::to_string(DEFAULT_IMG_W));
+    cmd.add<std::string>("source", 's', "RTSP source URL", false, DEFAULT_RTSP_SOURCE);
+    cmd.add<std::string>("size", 'g', "input_h, input_w", false,
+                         std::to_string(DEFAULT_IMG_H) + "," + std::to_string(DEFAULT_IMG_W));
     cmd.parse_check(argc, argv);
 
-    auto model_file = cmd.get<std::string>("model");
-    fs::path input_dir = cmd.get<std::string>("input-dir");
-    std::error_code filesystem_error;
-    input_dir = fs::absolute(input_dir, filesystem_error).lexically_normal();
-    if (filesystem_error)
-    {
-        fprintf(stderr, "Resolve input directory failed: %s\n", filesystem_error.message().c_str());
-        return -1;
-    }
-    if (input_dir.filename().empty() && input_dir != input_dir.root_path())
-    {
-        input_dir = input_dir.parent_path();
-    }
+    const std::string model_file = cmd.get<std::string>("model");
+    const std::string source = cmd.get<std::string>("source");
+    const std::string input_size_string = cmd.get<std::string>("size");
 
     if (!utilities::file_exist(model_file))
     {
         fprintf(stderr, "Input model file does not exist: %s\n", path_for_log(fs::path(model_file)).c_str());
         return -1;
     }
-
-    filesystem_error.clear();
-    if (!fs::is_directory(input_dir, filesystem_error))
+    if (source.empty())
     {
-        fprintf(stderr, "Input directory does not exist or is not a directory: %s\n", path_for_log(input_dir).c_str());
+        fprintf(stderr, "RTSP source must not be empty.\n");
         return -1;
     }
 
-    const fs::path output_dir = input_dir.parent_path() / DEFAULT_OUTPUT_DIR_NAME;
-    filesystem_error.clear();
-    fs::create_directories(output_dir, filesystem_error);
-    if (filesystem_error)
-    {
-        fprintf(stderr, "Create output directory failed: %s (%s)\n", path_for_log(output_dir).c_str(), filesystem_error.message().c_str());
-        return -1;
-    }
-
-    filesystem_error.clear();
-    if (fs::equivalent(input_dir, output_dir, filesystem_error) && !filesystem_error)
-    {
-        fprintf(stderr, "Input and output directories must be different: %s\n", path_for_log(input_dir).c_str());
-        return -1;
-    }
-
-    std::vector<fs::path> image_files;
-    if (!collect_image_files(input_dir, image_files))
-    {
-        return -1;
-    }
-    if (image_files.empty())
-    {
-        fprintf(stderr, "No supported images found in: %s\n", path_for_log(input_dir).c_str());
-        return -1;
-    }
-
-    const auto input_size_string = cmd.get<std::string>("size");
     std::array<int, 2> input_size = {DEFAULT_IMG_H, DEFAULT_IMG_W};
     bool input_size_valid = false;
     try
@@ -537,7 +1014,6 @@ int main(int argc, char *argv[])
     catch (const std::exception &)
     {
     }
-
     if (!input_size_valid || input_size[0] <= 0 || input_size[1] <= 0)
     {
         fprintf(stderr, "Input size is not allowed: %s\n", input_size_string.c_str());
@@ -546,47 +1022,79 @@ int main(int argc, char *argv[])
 
     fprintf(stdout, "--------------------------------------\n");
     fprintf(stdout, "model file : %s\n", path_for_log(fs::path(model_file)).c_str());
-    fprintf(stdout, "input dir : %s\n", path_for_log(input_dir).c_str());
-    fprintf(stdout, "output dir : %s\n", path_for_log(output_dir).c_str());
-    fprintf(stdout, "image count : %zu\n", image_files.size());
+    fprintf(stdout, "RTSP source : %s\n", source_for_log(source).c_str());
     fprintf(stdout, "img_h, img_w : %d %d\n", input_size[0], input_size[1]);
+    fprintf(stdout, "preview max : %d x %d\n", PREVIEW_MAX_WIDTH, PREVIEW_MAX_HEIGHT);
+    fprintf(stdout, "exit keys : Q / Esc\n");
     fprintf(stdout, "--------------------------------------\n");
 
-    const size_t input_data_size = static_cast<size_t>(input_size[0]) * static_cast<size_t>(input_size[1]) * 3;
-    std::vector<uint8_t> warmup_data(input_data_size, 0);
-    if (!prepare_warmup_data(image_files, warmup_data, input_size[0], input_size[1]))
+    LatestFrameCapture capture;
+    if (!capture.start(source))
     {
-        fprintf(stderr, "No image can be decoded for warm-up in: %s\n", path_for_log(input_dir).c_str());
+        fprintf(stderr, "Open RTSP source failed: %s\n", capture.error_message().c_str());
         return -1;
     }
 
-    if (const auto ret = axclInit(0); 0 != ret)
+    cv::Mat first_frame;
+    if (!capture.wait_for_first_frame(first_frame))
+    {
+        fprintf(stderr, "Read first RTSP frame failed: %s\n", capture.error_message().c_str());
+        return -1;
+    }
+
+    const CaptureInformation capture_information = capture.information();
+    fprintf(stdout, "OpenCV backend : %s%s\n", capture_information.backend.c_str(),
+            capture_information.used_automatic_fallback ? " (automatic fallback)" : "");
+    if (capture_information.timeout_supported)
+    {
+        fprintf(stdout, "requested capture timeout : %d ms\n", CAPTURE_TIMEOUT_MS);
+    }
+    else
+    {
+        fprintf(stdout, "requested capture timeout : unavailable in this OpenCV version\n");
+    }
+    fprintf(stdout, "stream frame : %d x %d\n", first_frame.cols, first_frame.rows);
+    if (capture_information.reported_fps > 0.0)
+    {
+        fprintf(stdout, "reported stream FPS : %.2f (backend metadata, may be inaccurate)\n",
+                capture_information.reported_fps);
+    }
+
+    const size_t input_data_size = static_cast<size_t>(input_size[0]) * static_cast<size_t>(input_size[1]) * 3;
+    std::vector<uint8_t> warmup_data(input_data_size, 0);
+    if (!prepare_warmup_data(first_frame, warmup_data, input_size[0], input_size[1]))
+    {
+        return -1;
+    }
+
+    if (const auto ret = axclInit(0); ret != 0)
     {
         fprintf(stderr, "Init AXCL failed{0x%8x}.\n", ret);
         return -1;
     }
 
     axclrtDeviceList device_list{};
-    if (const auto ret = axclrtGetDeviceList(&device_list); 0 != ret || 0 == device_list.num)
+    if (const auto ret = axclrtGetDeviceList(&device_list); ret != 0 || device_list.num == 0)
     {
         fprintf(stderr, "Get AXCL device failed{0x%8x}, find total %d device.\n", ret, device_list.num);
         axclFinalize();
         return -1;
     }
-    if (const auto ret = axclrtSetDevice(device_list.devices[0]); 0 != ret)
+    if (const auto ret = axclrtSetDevice(device_list.devices[0]); ret != 0)
     {
         fprintf(stderr, "Set AXCL device failed{0x%8x}.\n", ret);
         axclFinalize();
         return -1;
     }
-    if (const auto ret = axclrtEngineInit(AXCL_VNPU_DISABLE); 0 != ret)
+    if (const auto ret = axclrtEngineInit(AXCL_VNPU_DISABLE); ret != 0)
     {
         fprintf(stderr, "axclrtEngineInit %d\n", ret);
         axclFinalize();
         return ret;
     }
 
-    const bool success = ax::run_model(model_file, image_files, output_dir, warmup_data, input_size[0], input_size[1]);
+    const bool success = ax::run_model(model_file, capture, warmup_data, first_frame,
+                                       input_size[0], input_size[1]);
     axclFinalize();
     return success ? 0 : -1;
 }

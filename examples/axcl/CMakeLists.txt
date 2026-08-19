@@ -15,7 +15,7 @@
 # Author:
 #
 
-find_package(Threads)
+find_package(Threads REQUIRED)
 find_package(OpenCV REQUIRED)
 
 include("${CMAKE_SOURCE_DIR}/cmake/axcl.cmake")
@@ -37,6 +37,7 @@ axera_example(axcl_yolo11 ax_yolo11_steps.cc)
 axera_example(axcl_yolo11_seg ax_yolo11_seg_steps.cc)
 axera_example(axcl_yolo11_pose ax_yolo11_pose_steps.cc)
 axera_example(axcl_yolo26 ax_yolo26_steps.cc)
+target_link_libraries(axcl_yolo26 PRIVATE Threads::Threads)
 axera_example(axcl_yolo26_depth ax_yolo26_depth_steps.cc)
 axera_example(axcl_yolo_world_open_vocabulary ax_yolo_world_open_vocabulary_steps.cc)
 axera_example(axcl_palm_detection ax_palm_detection_steps.cc)
