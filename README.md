@@ -98,7 +98,7 @@ build-win\examples\axcl\axcl_yolo26.exe
 
 ### 4. 运行 YOLO26
 
-AX8850 使用 YOLO26 模型仓库 `ax650` 目录中的模型，首次验证建议使用 `yolo26n.axmodel`。
+程序默认读取 `D:\yolo26\yolo26x.axmodel`，并批量识别 `D:\yolo26\images` 第一层目录中的图片。
 
 运行前把 AXCL 和 OpenCV 的 DLL（动态链接库）目录临时加入 `PATH`：
 
@@ -106,13 +106,19 @@ AX8850 使用 YOLO26 模型仓库 `ax650` 目录中的模型，首次验证建�
 set "PATH=D:\AXCL\axcl\out\axcl_win_x64\bin;D:\opencv\opencv\build\x64\vc16\bin;%PATH%"
 ```
 
-假设模型和图片位于 `D:\yolo26`：
+使用默认路径直接运行：
 
 ```cmd
-build-win\examples\axcl\axcl_yolo26.exe -m D:\yolo26\yolo26n.axmodel -i D:\yolo26\bus.jpg
+build-win\examples\axcl\axcl_yolo26.exe
 ```
 
-默认结果图片为当前目录下的 `yolo26_out.jpg`。
+也可以通过 `-m` 和 `-i` 临时覆盖模型文件和输入目录：
+
+```cmd
+build-win\examples\axcl\axcl_yolo26.exe -m D:\models\yolo26n.axmodel -i D:\data\images
+```
+
+程序按文件名顺序处理输入目录第一层的 `.jpg`、`.jpeg`、`.png`、`.bmp`、`.webp`、`.tif` 和 `.tiff` 文件，扩展名不区分大小写。绘制结果保留原文件名和格式，写入输入目录同级的 `output` 文件夹。程序逐张输出从图片读取到结果写盘的完整识别耗时，并在最后输出平均、最小和最大耗时；模型加载、资源初始化及 5 次预热不计入该耗时。
 
 ## Linux 编译简版
 
@@ -126,7 +132,7 @@ cmake --build build --target axcl_yolo26 -j 4
 运行示例：
 
 ```bash
-./build/examples/axcl/axcl_yolo26 -m yolo26n.axmodel -i bus.jpg
+./build/examples/axcl/axcl_yolo26 -m yolo26n.axmodel -i images
 ```
 
 ## 常见问题
