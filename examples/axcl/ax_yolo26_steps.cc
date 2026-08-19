@@ -28,7 +28,6 @@
 #include <cstring>
 #include <exception>
 #include <filesystem>
-#include <numeric>
 #include <string>
 #include <vector>
 
@@ -46,7 +45,7 @@ const int DEFAULT_IMG_H = 640;
 const int DEFAULT_IMG_W = 640;
 const int WARMUP_COUNT = 5;
 
-const char *DEFAULT_MODEL_FILE = R"(D:\yolo26\yolo26x.axmodel)";
+const char *DEFAULT_MODEL_FILE = R"(D:\yolo26\yolo26m.axmodel)";
 const char *DEFAULT_INPUT_DIR = R"(D:\yolo26\images)";
 const char *DEFAULT_OUTPUT_DIR_NAME = "output";
 
@@ -70,6 +69,63 @@ namespace fs = std::filesystem;
 
 namespace
 {
+    using Clock = std::chrono::steady_clock;
+
+    struct RecognitionTiming
+    {
+        double image_load_ms = 0.0;
+        double preprocess_ms = 0.0;
+        double input_copy_ms = 0.0;
+        double inference_call_ms = 0.0;
+        double host_to_device_ms = 0.0;
+        double model_inference_ms = 0.0;
+        double device_to_host_ms = 0.0;
+        double postprocess_ms = 0.0;
+        double render_ms = 0.0;
+        double save_ms = 0.0;
+        double other_ms = 0.0;
+        double full_ms = 0.0;
+    };
+
+    double elapsed_ms(const Clock::time_point &start, const Clock::time_point &end)
+    {
+        return std::chrono::duration<double, std::milli>(end - start).count();
+    }
+
+    void print_timing_breakdown(const RecognitionTiming &timing)
+    {
+        fprintf(stdout, "time breakdown (AXCL sub-items are included in AXCL call total):\n");
+        fprintf(stdout, "  image load/decode : %8.3f ms\n", timing.image_load_ms);
+        fprintf(stdout, "  preprocess        : %8.3f ms\n", timing.preprocess_ms);
+        fprintf(stdout, "  input buffer copy : %8.3f ms\n", timing.input_copy_ms);
+        fprintf(stdout, "  AXCL call total   : %8.3f ms\n", timing.inference_call_ms);
+        fprintf(stdout, "    host to device  : %8.3f ms\n", timing.host_to_device_ms);
+        fprintf(stdout, "    model inference : %8.3f ms\n", timing.model_inference_ms);
+        fprintf(stdout, "    device to host  : %8.3f ms\n", timing.device_to_host_ms);
+        fprintf(stdout, "  postprocess       : %8.3f ms\n", timing.postprocess_ms);
+        fprintf(stdout, "  result render     : %8.3f ms\n", timing.render_ms);
+        fprintf(stdout, "  result save       : %8.3f ms\n", timing.save_ms);
+        fprintf(stdout, "  other overhead    : %8.3f ms\n", timing.other_ms);
+    }
+
+    void print_timing_statistics(const char *name, const std::vector<RecognitionTiming> &timings,
+                                 double RecognitionTiming::*field)
+    {
+        double total = 0.0;
+        double minimum = timings.front().*field;
+        double maximum = minimum;
+        for (const auto &timing : timings)
+        {
+            const double value = timing.*field;
+            total += value;
+            minimum = std::min(minimum, value);
+            maximum = std::max(maximum, value);
+        }
+
+        fprintf(stdout, "  %-19s avg %8.3f ms, min %8.3f ms, max %8.3f ms\n", name,
+                total / static_cast<double>(timings.size()), minimum, maximum);
+    }
+
     bool is_supported_image_file(const fs::path &file)
     {
         static const std::array<std::string, 7> SUPPORTED_EXTENSIONS = {
@@ -123,9 +179,15 @@ namespace
     }
 
     bool load_and_preprocess(const fs::path &image_file, cv::Mat &mat, std::vector<uint8_t> &data,
-                             int input_h, int input_w, bool report_error)
+                             int input_h, int input_w, bool report_error, RecognitionTiming *timing = nullptr)
     {
+        const auto load_start = Clock::now();
         mat = cv::imread(image_file.string(), cv::IMREAD_COLOR);
+        const auto load_end = Clock::now();
+        if (timing != nullptr)
+        {
+            timing->image_load_ms = elapsed_ms(load_start, load_end);
+        }
         if (mat.empty())
         {
             if (report_error)
@@ -135,7 +197,13 @@ namespace
             return false;
         }
 
+        const auto preprocess_start = Clock::now();
         common::get_input_data_letterbox(mat, data, input_h, input_w);
+        const auto preprocess_end = Clock::now();
+        if (timing != nullptr)
+        {
+            timing->preprocess_ms = elapsed_ms(preprocess_start, preprocess_end);
+        }
         return true;
     }
 
@@ -164,11 +232,13 @@ namespace
 namespace ax
 {
     bool post_process(const ax_runner_tensor_t *output, const int nOutputSize, const cv::Mat &mat,
-                      int input_w, int input_h, const fs::path &output_file)
+                      int input_w, int input_h, const fs::path &output_file, RecognitionTiming &timing)
     {
+        const auto postprocess_start = Clock::now();
         if (nOutputSize < 6)
         {
             fprintf(stderr, "Unexpected model output count: %d, expected at least 6.\n", nOutputSize);
+            timing.postprocess_ms = elapsed_ms(postprocess_start, Clock::now());
             return false;
         }
 
@@ -191,29 +261,43 @@ namespace ax
 
         detection::get_out_bbox(proposals, objects, NMS_THRESHOLD, input_h, input_w, mat.rows, mat.cols);
         fprintf(stdout, "detection num: %zu\n", objects.size());
+        timing.postprocess_ms = elapsed_ms(postprocess_start, Clock::now());
 
         const auto output_path = output_file.string();
-        return detection::draw_objects(mat, objects, CLASS_NAMES, output_path.c_str(), 0.5, 1, false);
+        detection::DrawObjectsTiming draw_timing;
+        const bool success = detection::draw_objects(mat, objects, CLASS_NAMES, output_path.c_str(), 0.5, 1, false,
+                                                     &draw_timing);
+        timing.render_ms = draw_timing.render_ms;
+        timing.save_ms = draw_timing.save_ms;
+        return success;
     }
 
     bool recognize_image(ax_runner_axcl &runner, const fs::path &image_file, const fs::path &output_file,
-                         std::vector<uint8_t> &data, int input_h, int input_w)
+                         std::vector<uint8_t> &data, int input_h, int input_w, RecognitionTiming &timing)
     {
         cv::Mat mat;
-        if (!load_and_preprocess(image_file, mat, data, input_h, input_w, true))
+        if (!load_and_preprocess(image_file, mat, data, input_h, input_w, true, &timing))
         {
             return false;
         }
 
+        const auto input_copy_start = Clock::now();
         memcpy(runner.get_input(0).pVirAddr, data.data(), data.size());
+        timing.input_copy_ms = elapsed_ms(input_copy_start, Clock::now());
+
+        const auto inference_start = Clock::now();
         const int ret = runner.inference();
+        timing.inference_call_ms = elapsed_ms(inference_start, Clock::now());
         if (ret != 0)
         {
             fprintf(stderr, "Inference failed for %s, ret=0x%x.\n", image_file.string().c_str(), ret);
             return false;
         }
+        timing.host_to_device_ms = runner.cost_host_to_device;
+        timing.model_inference_ms = runner.get_inference_time();
+        timing.device_to_host_ms = runner.cost_device_to_host;
 
-        if (!post_process(runner.get_outputs_ptr(0), runner.get_num_outputs(), mat, input_w, input_h, output_file))
+        if (!post_process(runner.get_outputs_ptr(0), runner.get_num_outputs(), mat, input_w, input_h, output_file, timing))
         {
             fprintf(stderr, "Write result failed: %s\n", output_file.string().c_str());
             return false;
@@ -262,7 +346,7 @@ namespace ax
         }
 
         std::vector<uint8_t> data(warmup_data.size(), 0);
-        std::vector<double> time_costs;
+        std::vector<RecognitionTiming> time_costs;
         size_t failed_count = 0;
 
         for (size_t i = 0; i < image_files.size(); ++i)
@@ -271,24 +355,30 @@ namespace ax
             const fs::path output_file = output_dir / image_file.filename();
             fprintf(stdout, "\n[%zu/%zu] image: %s\n", i + 1, image_files.size(), image_file.string().c_str());
 
-            const auto start = std::chrono::steady_clock::now();
+            RecognitionTiming timing;
+            const auto start = Clock::now();
             bool success = false;
             try
             {
-                success = recognize_image(runner, image_file, output_file, data, input_h, input_w);
+                success = recognize_image(runner, image_file, output_file, data, input_h, input_w, timing);
             }
             catch (const std::exception &exception)
             {
                 fprintf(stderr, "Recognize image failed: %s (%s)\n", image_file.string().c_str(), exception.what());
             }
-            const auto end = std::chrono::steady_clock::now();
-            const double elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
+            const auto end = Clock::now();
+            timing.full_ms = elapsed_ms(start, end);
+            const double accounted_ms = timing.image_load_ms + timing.preprocess_ms + timing.input_copy_ms
+                                      + timing.inference_call_ms + timing.postprocess_ms + timing.render_ms
+                                      + timing.save_ms;
+            timing.other_ms = std::max(0.0, timing.full_ms - accounted_ms);
 
-            fprintf(stdout, "full recognition time: %.3f ms (%s)\n", elapsed_ms, success ? "success" : "failed");
+            print_timing_breakdown(timing);
+            fprintf(stdout, "full recognition time: %.3f ms (%s)\n", timing.full_ms, success ? "success" : "failed");
             if (success)
             {
                 fprintf(stdout, "result file: %s\n", output_file.string().c_str());
-                time_costs.push_back(elapsed_ms);
+                time_costs.push_back(timing);
             }
             else
             {
@@ -300,10 +390,30 @@ namespace ax
         fprintf(stdout, "batch summary: success %zu, failed %zu\n", time_costs.size(), failed_count);
         if (!time_costs.empty())
         {
-            const double total_time = std::accumulate(time_costs.begin(), time_costs.end(), 0.0);
-            const auto min_max_time = std::minmax_element(time_costs.begin(), time_costs.end());
+            fprintf(stdout, "time breakdown (successful images; AXCL sub-items are included in AXCL call total):\n");
+            print_timing_statistics("image load/decode", time_costs, &RecognitionTiming::image_load_ms);
+            print_timing_statistics("preprocess", time_costs, &RecognitionTiming::preprocess_ms);
+            print_timing_statistics("input buffer copy", time_costs, &RecognitionTiming::input_copy_ms);
+            print_timing_statistics("AXCL call total", time_costs, &RecognitionTiming::inference_call_ms);
+            print_timing_statistics("  host to device", time_costs, &RecognitionTiming::host_to_device_ms);
+            print_timing_statistics("  model inference", time_costs, &RecognitionTiming::model_inference_ms);
+            print_timing_statistics("  device to host", time_costs, &RecognitionTiming::device_to_host_ms);
+            print_timing_statistics("postprocess", time_costs, &RecognitionTiming::postprocess_ms);
+            print_timing_statistics("result render", time_costs, &RecognitionTiming::render_ms);
+            print_timing_statistics("result save", time_costs, &RecognitionTiming::save_ms);
+            print_timing_statistics("other overhead", time_costs, &RecognitionTiming::other_ms);
+
+            double total_time = 0.0;
+            double minimum_time = time_costs.front().full_ms;
+            double maximum_time = minimum_time;
+            for (const auto &timing : time_costs)
+            {
+                total_time += timing.full_ms;
+                minimum_time = std::min(minimum_time, timing.full_ms);
+                maximum_time = std::max(maximum_time, timing.full_ms);
+            }
             fprintf(stdout, "full recognition time: avg %.3f ms, min %.3f ms, max %.3f ms\n",
-                    total_time / static_cast<double>(time_costs.size()), *min_max_time.first, *min_max_time.second);
+                    total_time / static_cast<double>(time_costs.size()), minimum_time, maximum_time);
         }
         fprintf(stdout, "--------------------------------------\n");
 

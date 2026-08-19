@@ -22,6 +22,7 @@
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-function"
 
+#include <chrono>
 #include <cstdint>
 #include <opencv2/opencv.hpp>
 #include <vector>
@@ -34,6 +35,12 @@
 #endif
 namespace detection
 {
+    struct DrawObjectsTiming
+    {
+        double render_ms = 0.0;
+        double save_ms = 0.0;
+    };
+
     typedef struct
     {
         int grid0;
@@ -1808,8 +1815,11 @@ namespace detection
         }
     }
 
-    static bool draw_objects(const cv::Mat& bgr, const std::vector<Object>& objects, const char** class_names, const char* output_name, double fontScale = 0.5, int thickness = 1, bool append_jpg_extension = true)
+    static bool draw_objects(const cv::Mat& bgr, const std::vector<Object>& objects, const char** class_names,
+                             const char* output_name, double fontScale = 0.5, int thickness = 1,
+                             bool append_jpg_extension = true, DrawObjectsTiming* timing = nullptr)
     {
+        const auto render_start = std::chrono::steady_clock::now();
         static const std::vector<cv::Scalar> COCO_COLORS = {
             {128, 56, 0, 255}, {128, 226, 255, 0}, {128, 0, 94, 255}, {128, 0, 37, 255}, {128, 0, 255, 94}, {128, 255, 226, 0}, {128, 0, 18, 255}, {128, 255, 151, 0}, {128, 170, 0, 255}, {128, 0, 255, 56}, {128, 255, 0, 75}, {128, 0, 75, 255}, {128, 0, 255, 169}, {128, 255, 0, 207}, {128, 75, 255, 0}, {128, 207, 0, 255}, {128, 37, 0, 255}, {128, 0, 207, 255}, {128, 94, 0, 255}, {128, 0, 255, 113}, {128, 255, 18, 0}, {128, 255, 0, 56}, {128, 18, 0, 255}, {128, 0, 255, 226}, {128, 170, 255, 0}, {128, 255, 0, 245}, {128, 151, 255, 0}, {128, 132, 255, 0}, {128, 75, 0, 255}, {128, 151, 0, 255}, {128, 0, 151, 255}, {128, 132, 0, 255}, {128, 0, 255, 245}, {128, 255, 132, 0}, {128, 226, 0, 255}, {128, 255, 37, 0}, {128, 207, 255, 0}, {128, 0, 255, 207}, {128, 94, 255, 0}, {128, 0, 226, 255}, {128, 56, 255, 0}, {128, 255, 94, 0}, {128, 255, 113, 0}, {128, 0, 132, 255}, {128, 255, 0, 132}, {128, 255, 170, 0}, {128, 255, 0, 188}, {128, 113, 255, 0}, {128, 245, 0, 255}, {128, 113, 0, 255}, {128, 255, 188, 0}, {128, 0, 113, 255}, {128, 255, 0, 0}, {128, 0, 56, 255}, {128, 255, 0, 113}, {128, 0, 255, 188}, {128, 255, 0, 94}, {128, 255, 0, 18}, {128, 18, 255, 0}, {128, 0, 255, 132}, {128, 0, 188, 255}, {128, 0, 245, 255}, {128, 0, 169, 255}, {128, 37, 255, 0}, {128, 255, 0, 151}, {128, 188, 0, 255}, {128, 0, 255, 37}, {128, 0, 255, 0}, {128, 255, 0, 170}, {128, 255, 0, 37}, {128, 255, 75, 0}, {128, 0, 0, 255}, {128, 255, 207, 0}, {128, 255, 0, 226}, {128, 255, 245, 0}, {128, 188, 255, 0}, {128, 0, 255, 18}, {128, 0, 255, 75}, {128, 0, 255, 151}, {128, 255, 56, 0}, {128, 245, 255, 0}};
         cv::Mat image = bgr.clone();
@@ -1842,9 +1852,21 @@ namespace detection
             cv::putText(image, text, cv::Point(x, y + label_size.height), cv::FONT_HERSHEY_SIMPLEX, fontScale,
                         cv::Scalar(255, 255, 255), thickness);
         }
+        const auto render_end = std::chrono::steady_clock::now();
+        if (timing != nullptr)
+        {
+            timing->render_ms = std::chrono::duration<double, std::milli>(render_end - render_start).count();
+        }
 
         const std::string output_path = append_jpg_extension ? std::string(output_name) + ".jpg" : std::string(output_name);
-        return cv::imwrite(output_path, image);
+        const auto save_start = std::chrono::steady_clock::now();
+        const bool success = cv::imwrite(output_path, image);
+        const auto save_end = std::chrono::steady_clock::now();
+        if (timing != nullptr)
+        {
+            timing->save_ms = std::chrono::duration<double, std::milli>(save_end - save_start).count();
+        }
+        return success;
     }
 
     static void draw_keypoints(const cv::Mat& bgr, const std::vector<Object>& objects,
