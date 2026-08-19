@@ -28,16 +28,20 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <exception>
 #include <filesystem>
 #include <limits>
 #include <mutex>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
 
 #ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -206,6 +210,99 @@ namespace
     std::string path_for_log(const fs::path &path)
     {
         return path.u8string();
+    }
+
+    fs::path make_console_log_path()
+    {
+        const auto now = std::chrono::system_clock::now();
+        const std::time_t now_time = std::chrono::system_clock::to_time_t(now);
+        std::tm local_time{};
+#ifdef _WIN32
+        const bool has_local_time = localtime_s(&local_time, &now_time) == 0;
+#else
+        const bool has_local_time = localtime_r(&now_time, &local_time) != nullptr;
+#endif
+
+        std::string timestamp = "latest";
+        char timestamp_buffer[32]{};
+        if (has_local_time &&
+            std::strftime(timestamp_buffer, sizeof(timestamp_buffer), "%Y%m%d_%H%M%S", &local_time) > 0)
+        {
+            timestamp = timestamp_buffer;
+        }
+
+        return fs::path("log") / ("axcl_yolo26_console_" + timestamp + ".log");
+    }
+
+    bool redirect_console_output()
+    {
+        std::error_code error;
+        fs::create_directories("log", error);
+        if (error)
+        {
+            fprintf(stderr, "Create log directory failed: %s\n", error.message().c_str());
+            return false;
+        }
+
+        const fs::path log_file = make_console_log_path();
+        const std::string log_path = path_for_log(log_file);
+        fprintf(stdout, "日志文件：%s\n", log_path.c_str());
+        fflush(stdout);
+        fflush(stderr);
+
+#ifdef _WIN32
+        HANDLE log_handle = CreateFileW(log_file.c_str(), FILE_APPEND_DATA,
+                                        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+                                        FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (log_handle == INVALID_HANDLE_VALUE)
+        {
+            fprintf(stderr, "Open console log failed, Windows error: %lu\n", GetLastError());
+            return false;
+        }
+
+        const int log_descriptor =
+            _open_osfhandle(reinterpret_cast<intptr_t>(log_handle), _O_WRONLY | _O_TEXT);
+        if (log_descriptor == -1)
+        {
+            CloseHandle(log_handle);
+            fprintf(stderr, "Open console log descriptor failed.\n");
+            return false;
+        }
+
+        if (_dup2(log_descriptor, _fileno(stdout)) != 0 ||
+            _dup2(log_descriptor, _fileno(stderr)) != 0)
+        {
+            _close(log_descriptor);
+            fprintf(stderr, "Redirect console output failed.\n");
+            return false;
+        }
+        _close(log_descriptor);
+
+        const intptr_t stdout_handle = _get_osfhandle(_fileno(stdout));
+        const intptr_t stderr_handle = _get_osfhandle(_fileno(stderr));
+        if (stdout_handle == -1 || stderr_handle == -1 ||
+            !SetStdHandle(STD_OUTPUT_HANDLE, reinterpret_cast<HANDLE>(stdout_handle)) ||
+            !SetStdHandle(STD_ERROR_HANDLE, reinterpret_cast<HANDLE>(stderr_handle)))
+        {
+            fprintf(stderr, "Redirect Windows standard handles failed, error: %lu\n", GetLastError());
+            return false;
+        }
+#else
+        if (freopen(log_path.c_str(), "a", stdout) == nullptr)
+        {
+            fprintf(stderr, "Redirect standard output failed.\n");
+            return false;
+        }
+        if (freopen(log_path.c_str(), "a", stderr) == nullptr)
+        {
+            fprintf(stdout, "Redirect standard error failed.\n");
+            return false;
+        }
+#endif
+
+        fprintf(stdout, "标准输出和标准错误已重定向到：%s\n", log_path.c_str());
+        fflush(stdout);
+        return true;
     }
 
     std::string source_for_log(const std::string &source)
@@ -982,6 +1079,11 @@ int main(int argc, char *argv[])
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
 #endif
+
+    if (!redirect_console_output())
+    {
+        return -1;
+    }
 
     cmdline::parser cmd;
     cmd.add<std::string>("model", 'm', "joint file(a.k.a. joint model)", false, DEFAULT_MODEL_FILE);
