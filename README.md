@@ -79,10 +79,7 @@ cd /d D:\axcl-samples
 生成 Release 配置：
 
 ```cmd
-cmake -S . -B build-win -G Ninja ^
-  -DCMAKE_BUILD_TYPE=Release ^
-  -DAXCL_DIR=D:\AXCL\axcl\out\axcl_win_x64 ^
-  -DOpenCV_DIR=D:\opencv\opencv\build\x64\vc16\lib
+cmake -S . -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Release -DAXCL_DIR=D:\AXCL\axcl\out\axcl_win_x64 -DOpenCV_DIR=D:\opencv\opencv\build\x64\vc16\lib
 ```
 
 只编译 YOLO26 示例：
@@ -112,9 +109,7 @@ set "PATH=D:\AXCL\axcl\out\axcl_win_x64\bin;D:\opencv\opencv\build\x64\vc16\bin;
 假设模型和图片位于 `D:\yolo26`：
 
 ```cmd
-build-win\examples\axcl\axcl_yolo26.exe ^
-  -m D:\yolo26\yolo26n.axmodel ^
-  -i D:\yolo26\bus.jpg
+build-win\examples\axcl\axcl_yolo26.exe -m D:\yolo26\yolo26n.axmodel -i D:\yolo26\bus.jpg
 ```
 
 默认结果图片为当前目录下的 `yolo26_out.jpg`。
