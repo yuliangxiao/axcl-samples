@@ -31,6 +31,16 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 #include <opencv2/opencv.hpp>
 #include "base/common.hpp"
 #include "base/detection.hpp"
@@ -70,6 +80,11 @@ namespace fs = std::filesystem;
 namespace
 {
     using Clock = std::chrono::steady_clock;
+
+    std::string path_for_log(const fs::path &path)
+    {
+        return path.u8string();
+    }
 
     struct RecognitionTiming
     {
@@ -152,7 +167,7 @@ namespace
         fs::directory_iterator iterator(input_dir, error);
         if (error)
         {
-            fprintf(stderr, "Open input directory failed: %s (%s)\n", input_dir.string().c_str(), error.message().c_str());
+            fprintf(stderr, "Open input directory failed: %s (%s)\n", path_for_log(input_dir).c_str(), error.message().c_str());
             return false;
         }
 
@@ -166,13 +181,13 @@ namespace
             }
             else if (type_error)
             {
-                fprintf(stderr, "Read directory entry failed: %s (%s)\n", iterator->path().string().c_str(), type_error.message().c_str());
+                fprintf(stderr, "Read directory entry failed: %s (%s)\n", path_for_log(iterator->path()).c_str(), type_error.message().c_str());
             }
 
             iterator.increment(error);
             if (error)
             {
-                fprintf(stderr, "Scan input directory failed: %s (%s)\n", input_dir.string().c_str(), error.message().c_str());
+                fprintf(stderr, "Scan input directory failed: %s (%s)\n", path_for_log(input_dir).c_str(), error.message().c_str());
                 return false;
             }
         }
@@ -191,7 +206,7 @@ namespace
         {
             if (report_error)
             {
-                fprintf(stderr, "Read image failed: %s\n", image_file.string().c_str());
+                fprintf(stderr, "Read image failed: %s\n", path_for_log(image_file).c_str());
             }
             return false;
         }
@@ -288,7 +303,7 @@ namespace ax
         if (ret != 0)
         {
             finish_recognition_timing();
-            fprintf(stderr, "Inference failed for %s, ret=0x%x.\n", image_file.string().c_str(), ret);
+            fprintf(stderr, "Inference failed for %s, ret=0x%x.\n", path_for_log(image_file).c_str(), ret);
             return false;
         }
         timing.host_to_device_ms = runner.cost_host_to_device;
@@ -357,7 +372,7 @@ namespace ax
         {
             const auto &image_file = image_files[i];
             const fs::path output_file = output_dir / image_file.filename();
-            fprintf(stdout, "\n[%zu/%zu] 图片：%s\n", i + 1, image_files.size(), image_file.string().c_str());
+            fprintf(stdout, "\n[%zu/%zu] 图片：%s\n", i + 1, image_files.size(), path_for_log(image_file).c_str());
 
             RecognitionTiming timing;
             cv::Mat mat;
@@ -370,7 +385,7 @@ namespace ax
             }
             catch (const std::exception &exception)
             {
-                fprintf(stderr, "Recognize image failed: %s (%s)\n", image_file.string().c_str(), exception.what());
+                fprintf(stderr, "Recognize image failed: %s (%s)\n", path_for_log(image_file).c_str(), exception.what());
             }
 
             print_recognition_timing(timing, recognition_success);
@@ -393,19 +408,19 @@ namespace ax
                                                          0.5, 1, false, &output_timing);
                 if (!output_success)
                 {
-                    fprintf(stderr, "Write result failed: %s\n", output_file.string().c_str());
+                    fprintf(stderr, "Write result failed: %s\n", path_for_log(output_file).c_str());
                 }
             }
             catch (const std::exception &exception)
             {
-                fprintf(stderr, "Write result failed: %s (%s)\n", output_file.string().c_str(), exception.what());
+                fprintf(stderr, "Write result failed: %s (%s)\n", path_for_log(output_file).c_str(), exception.what());
             }
 
             print_output_timing(output_timing, output_success);
             if (output_success)
             {
                 output_time_costs.push_back(output_timing);
-                fprintf(stdout, "结果文件：%s\n", output_file.string().c_str());
+                fprintf(stdout, "结果文件：%s\n", path_for_log(output_file).c_str());
             }
             else
             {
@@ -448,6 +463,10 @@ namespace ax
 
 int main(int argc, char *argv[])
 {
+#ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);
+#endif
+
     cmdline::parser cmd;
     cmd.add<std::string>("model", 'm', "joint file(a.k.a. joint model)", false, DEFAULT_MODEL_FILE);
     cmd.add<std::string>("input-dir", 'i', "input image directory", false, DEFAULT_INPUT_DIR);
@@ -470,14 +489,14 @@ int main(int argc, char *argv[])
 
     if (!utilities::file_exist(model_file))
     {
-        fprintf(stderr, "Input model file does not exist: %s\n", model_file.c_str());
+        fprintf(stderr, "Input model file does not exist: %s\n", path_for_log(fs::path(model_file)).c_str());
         return -1;
     }
 
     filesystem_error.clear();
     if (!fs::is_directory(input_dir, filesystem_error))
     {
-        fprintf(stderr, "Input directory does not exist or is not a directory: %s\n", input_dir.string().c_str());
+        fprintf(stderr, "Input directory does not exist or is not a directory: %s\n", path_for_log(input_dir).c_str());
         return -1;
     }
 
@@ -486,14 +505,14 @@ int main(int argc, char *argv[])
     fs::create_directories(output_dir, filesystem_error);
     if (filesystem_error)
     {
-        fprintf(stderr, "Create output directory failed: %s (%s)\n", output_dir.string().c_str(), filesystem_error.message().c_str());
+        fprintf(stderr, "Create output directory failed: %s (%s)\n", path_for_log(output_dir).c_str(), filesystem_error.message().c_str());
         return -1;
     }
 
     filesystem_error.clear();
     if (fs::equivalent(input_dir, output_dir, filesystem_error) && !filesystem_error)
     {
-        fprintf(stderr, "Input and output directories must be different: %s\n", input_dir.string().c_str());
+        fprintf(stderr, "Input and output directories must be different: %s\n", path_for_log(input_dir).c_str());
         return -1;
     }
 
@@ -504,7 +523,7 @@ int main(int argc, char *argv[])
     }
     if (image_files.empty())
     {
-        fprintf(stderr, "No supported images found in: %s\n", input_dir.string().c_str());
+        fprintf(stderr, "No supported images found in: %s\n", path_for_log(input_dir).c_str());
         return -1;
     }
 
@@ -526,9 +545,9 @@ int main(int argc, char *argv[])
     }
 
     fprintf(stdout, "--------------------------------------\n");
-    fprintf(stdout, "model file : %s\n", model_file.c_str());
-    fprintf(stdout, "input dir : %s\n", input_dir.string().c_str());
-    fprintf(stdout, "output dir : %s\n", output_dir.string().c_str());
+    fprintf(stdout, "model file : %s\n", path_for_log(fs::path(model_file)).c_str());
+    fprintf(stdout, "input dir : %s\n", path_for_log(input_dir).c_str());
+    fprintf(stdout, "output dir : %s\n", path_for_log(output_dir).c_str());
     fprintf(stdout, "image count : %zu\n", image_files.size());
     fprintf(stdout, "img_h, img_w : %d %d\n", input_size[0], input_size[1]);
     fprintf(stdout, "--------------------------------------\n");
@@ -537,7 +556,7 @@ int main(int argc, char *argv[])
     std::vector<uint8_t> warmup_data(input_data_size, 0);
     if (!prepare_warmup_data(image_files, warmup_data, input_size[0], input_size[1]))
     {
-        fprintf(stderr, "No image can be decoded for warm-up in: %s\n", input_dir.string().c_str());
+        fprintf(stderr, "No image can be decoded for warm-up in: %s\n", path_for_log(input_dir).c_str());
         return -1;
     }
 
