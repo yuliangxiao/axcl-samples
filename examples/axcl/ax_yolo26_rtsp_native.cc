@@ -69,6 +69,7 @@ extern "C" {
 #include "base/detection.hpp"
 #include "utilities/cmdline.hpp"
 #include "utilities/file.hpp"
+#include "yolo26_defaults.hpp"
 
 namespace fs = std::filesystem;
 
@@ -92,9 +93,6 @@ constexpr AX_VDEC_CHN kVdecChannel = 0;
 constexpr AX_U32 kH264FrameBufferCount = 32;
 constexpr AX_S32 kAxWaitMs = 100;
 
-const char* kDefaultModel = R"(D:\yolo26\yolo26m.axmodel)";
-const char* kDefaultRtsp = "";
-
 const char* kClassNames[kClassCount] = {
     "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light",
     "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
@@ -114,8 +112,8 @@ enum class RunMode {
 
 struct Options {
     RunMode mode{RunMode::kInfer};
-    std::string source{kDefaultRtsp};
-    std::string model{kDefaultModel};
+    std::string source{yolo26_defaults::kRtspSource};
+    std::string model{yolo26_defaults::kModelPath};
     std::string axcl_config;
     std::string dump_ivps;
     int device_index{0};
@@ -1534,8 +1532,8 @@ bool ParseOptions(int argc, char* argv[], Options* options) {
     }
     cmdline::parser command;
     command.add<std::string>("mode", 'r', "vdec-smoke | ivps-smoke | infer", false, "infer");
-    command.add<std::string>("source", 's', "RTSP H.264 source URL", false, kDefaultRtsp);
-    command.add<std::string>("model", 'm', "YOLO26 AX model path", false, kDefaultModel);
+    command.add<std::string>("source", 's', "RTSP H.264 source URL", false, yolo26_defaults::kRtspSource);
+    command.add<std::string>("model", 'm', "YOLO26 AX model path", false, yolo26_defaults::kModelPath);
     command.add<std::string>("config", 'c', "AXCL JSON config path", false, "");
     command.add<std::string>("dump-ivps", 'p', "one-shot 640x640 BGR raw dump path", false, "");
     command.add<int>("device", 'd', "AXCL device-list index", false, 0);

@@ -161,7 +161,13 @@ cmake --build build-native --target ax_yolo26_rtsp_native -j 4
 build-native\examples\axcl\ax_yolo26_rtsp_native.exe
 ```
 
-下列命令中的 RTSP URL 只作为格式示例，请替换为实际地址。程序日志会隐藏密码；源码和默认参数不保存 RTSP 凭据。
+原生目标与上面的 OpenCV 目标共享默认模型路径和 RTSP 地址。无参数启动时默认进入 `infer` 模式：
+
+```cmd
+build-native\examples\axcl\ax_yolo26_rtsp_native.exe
+```
+
+也可以通过 `--model`/`-m` 和 `--source`/`-s` 覆盖默认值。下列命令中的 RTSP URL 只作为覆盖格式示例，请替换为实际地址。程序日志会隐藏密码，但共享默认地址仍以明文存在于 `examples\axcl\yolo26_defaults.hpp` 中。
 
 ### 阶段一：VDEC smoke
 

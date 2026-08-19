@@ -65,6 +65,7 @@
 #include "utilities/args.hpp"
 #include "utilities/cmdline.hpp"
 #include "utilities/file.hpp"
+#include "yolo26_defaults.hpp"
 
 #include <axcl.h>
 #include "ax_model_runner/ax_model_runner_axcl.hpp"
@@ -76,8 +77,6 @@ constexpr int PREVIEW_MAX_WIDTH = 1280;
 constexpr int PREVIEW_MAX_HEIGHT = 720;
 constexpr int CAPTURE_TIMEOUT_MS = 5000;
 
-const char *DEFAULT_MODEL_FILE = R"(D:\yolo26\yolo26m.axmodel)";
-const char *DEFAULT_RTSP_SOURCE = R"(rtsp://admin:Htl20243@192.168.0.201:554/Streaming/Channels/101)";
 const char *WINDOW_NAME = "AXCL YOLO26 RTSP";
 
 const char *CLASS_NAMES[] = {
@@ -1086,8 +1085,8 @@ int main(int argc, char *argv[])
     }
 
     cmdline::parser cmd;
-    cmd.add<std::string>("model", 'm', "joint file(a.k.a. joint model)", false, DEFAULT_MODEL_FILE);
-    cmd.add<std::string>("source", 's', "RTSP source URL", false, DEFAULT_RTSP_SOURCE);
+    cmd.add<std::string>("model", 'm', "joint file(a.k.a. joint model)", false, yolo26_defaults::kModelPath);
+    cmd.add<std::string>("source", 's', "RTSP source URL", false, yolo26_defaults::kRtspSource);
     cmd.add<std::string>("size", 'g', "input_h, input_w", false,
                          std::to_string(DEFAULT_IMG_H) + "," + std::to_string(DEFAULT_IMG_W));
     cmd.parse_check(argc, argv);
