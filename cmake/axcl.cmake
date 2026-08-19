@@ -28,8 +28,14 @@ function(axera_example example_name)
 
     # opencv
     target_link_libraries(${example_name} PRIVATE ${OpenCV_LIBS})
-    target_link_libraries(${example_name} PRIVATE axcl_rt)
-    target_compile_options (${example_name} PUBLIC $<$<COMPILE_LANGUAGE:C,CXX>: -O3>)
+
+    if(MSVC)
+        target_link_libraries(${example_name} PRIVATE "${AXCL_DIR}/lib/libaxcl_rt.lib")
+        target_compile_options(${example_name} PRIVATE /utf-8)
+    else()
+        target_link_libraries(${example_name} PRIVATE axcl_rt)
+        target_compile_options(${example_name} PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:-O3>)
+    endif()
 
     install(TARGETS ${example_name} DESTINATION bin)
 endfunction()

@@ -2,139 +2,158 @@
 
 # axcl-samples
 
-## 简介
+## 项目简介
 
-**AXCL-Samples** 由 爱芯元智 主导开发。该项目实现了常见的**深度学习开源算法**在基于 **爱芯元智** 的 SoC 实现的 **PCIE算力卡** 产品上的运行的示例代码，方便社区开发者进行快速评估和适配。
+`axcl-samples` 提供在爱芯元智 PCIe 算力卡上运行常见视觉模型的 C++ 示例，基于 AXCL Runtime（运行时）完成设备管理、模型加载和推理。
 
-### 支持系统
+当前仓库支持 Ubuntu、Debian 和 Windows 11，主要板卡如下：
 
-- Ubuntu
-- Debian
-- Windows 11
+| 板卡 | 芯片 | 资料 |
+| --- | --- | --- |
+| AI Core AX-M1 | AX650N | [文档](https://docs.radxa.com/en/aicore/ax-m1) |
+| M4Chat | AX8850 | [Wiki](https://wiki.sipeed.com/hardware/zh/maixIV/m4chat/intro.html) |
+| LLM-8850 Card | AX8850 | [文档](https://docs.m5stack.com/zh_CN/ai_hardware/LLM-8850_Card) |
 
-### 支持板卡
+本文以 Windows 11、AX8850 和 `axcl_yolo26` 为主要示例。
 
-| 板卡 | 图片 | 芯片 | 厂商 | 链接 |
-| ---- | ---- | ---- | ---- | ---- |
-| AI Core AX-M1 | <img src="docs/boards/aicore_ax_m1_top.jpg" width="200"> | AX650N | Radxa | [文档](https://docs.radxa.com/en/aicore/ax-m1) |
-| M4Chat | <img src="docs/boards/m4chat.jpg" width="200"> | AX8850 | Sipeed | [Wiki](https://wiki.sipeed.com/hardware/zh/maixIV/m4chat/intro.html) |
-| LLM-8850 Card | <img src="docs/boards/AI-001_LLM-8850-main-pictures_01.jpg" width="200"> | AX8850 | M5Stack | [文档](https://docs.m5stack.com/zh_CN/ai_hardware/LLM-8850_Card) |
+## 获取代码
 
-## AXCL
-
-**AXCL** 是用于在 Axera 芯片平台上开发深度神经网络推理、转码等应用的 C、Python 语言 API 库，提供运行资源管理，内存管理，模型加载和执行，媒体数据处理等 API。
-
-- [在线文档](https://axcl-docs.readthedocs.io/zh-cn/latest/index.html)
-
-## 快速上手
-
-### 本地编译
-
-- 默认已经按照 [AXCL在线文档](https://axcl-docs.readthedocs.io/zh-cn/latest/index.html) 说明正确完成 AXCL 相关 deb 包安装，相关头文件和库文件分别已安装在 `/usr/include/axcl/` 和 `/usr/lib/axcl/` 路径下；
-- 本示例在 Raspberry Pi 5 上进行操作。
-
-#### 下载项目
-
-```
+```cmd
 git clone https://github.com/AXERA-TECH/axcl-samples.git
+cd axcl-samples
 ```
 
-#### 安装编译工具
-通过 `apt install` 安装必要的编译工具
+## Windows 11 编译与运行
 
-```
-sudo apt update
-sudo apt install build-essential cmake libopencv-dev 
-```
+### 1. 准备环境
 
-#### 编译详情
+需要准备：
 
-```
-mkdir build && cd build
-cmake ..
-make install -j4
-```
+- Windows 11 x64；
+- Visual Studio 2022，并安装“使用 C++ 的桌面开发”；
+- CMake 和 Ninja（构建工具）；
+- AXCL Windows x64 SDK（软件开发工具包）、驱动和 Runtime；
+- OpenCV Windows x64；
+- 与 AX8850 匹配的 `.axmodel` 模型。
 
-编译完成后在 `./install/bin` 下生成相关示例程序
+以下目录是本文使用的示例，请按实际安装位置调整：
 
-```
-axera@raspberrypi:~/temp/axcl-samples/build $ tree install
-install
-└── bin
-    ├── ax_classification
-    ├── ax_depth_anything
-    ├── ax_yolo11
-    ├── ax_yolo11_pose
-    ├── ax_yolo11_seg
-    ├── ax_yolov10
-    ├── ax_yolov10_u
-    ├── ax_yolov5_face
-    ├── ax_yolov5s
-    ├── ax_yolov5s_seg
-    ├── ax_yolov8
-    ├── ax_yolov8_pose
-    ├── ax_yolov8_seg
-    ├── ax_yolov9
-    └── ax_yolov9_u
+```text
+AXCL_DIR   = D:\AXCL\axcl\out\axcl_win_x64
+OpenCV_DIR = D:\opencv\opencv\build\x64\vc16\lib
 ```
 
-## 示例运行
+配置前确认：
 
-```
-axera@raspberrypi:~/temp/axcl-samples/build $ ./install/bin/ax_yolo11 -m yolo11x.axmodel -i ssd_horse.jpg
---------------------------------------
-model file : yolo11x.axmodel
-image file : ssd_horse.jpg
-img_h, img_w : 640 640
---------------------------------------
+- `AXCL_DIR` 指向的目录下存在 `include`、`lib`、`bin`；
+- `lib\libaxcl_rt.lib` 存在；
+- `OpenCV_DIR` 指向的目录下存在 `OpenCVConfig.cmake`。
 
-input size: 1
-    name:   images [unknown] [unknown]
-        1 x 640 x 640 x 3
+### 2. 检查工具和设备
 
+打开 **Visual Studio 2022 Developer Command Prompt**（开发者命令提示符），不要使用未加载 MSVC（微软 C/C++ 编译器）环境的普通终端。
 
-output size: 3
-    name: /model.23/Concat_output_0
-        1 x 80 x 80 x 144
-
-    name: /model.23/Concat_1_output_0
-        1 x 40 x 40 x 144
-
-    name: /model.23/Concat_2_output_0
-        1 x 20 x 20 x 144
-
-==================================================
-
-Engine push input is done.
---------------------------------------
-post process cost time:1.09 ms
---------------------------------------
-Repeat 1 times, avg time 43.09 ms, max_time 43.09 ms, min_time 43.09 ms
---------------------------------------
-detection num: 6
-17:  96%, [ 216,   71,  423,  370], horse
-16:  93%, [ 144,  203,  196,  345], dog
- 0:  89%, [ 273,   14,  349,  231], person
- 2:  88%, [   1,  105,  132,  197], car
- 0:  82%, [ 431,  124,  451,  178], person
-19:  46%, [ 171,  137,  202,  169], cow
---------------------------------------
+```cmd
+cl
+cmake --version
+ninja --version
+D:\AXCL\axcl\out\axcl_win_x64\bin\axcl-smi.exe
 ```
 
-## 其他资源
+如果找不到 Ninja，先把 `ninja.exe` 所在目录加入 `PATH`，例如：
 
-### 网盘资源
+```cmd
+set "PATH=D:\ninja-win;%PATH%"
+```
 
-- 提供 **ModelZoo**, **预编译程序**, **测试图片** 等内容:
-  - [Huggingface](https://huggingface.co/collections/AXERA-TECH/vision-models-67b0bce92ddc61229e8e94ed)
-  - [Modelscope](https://modelscope.cn/organization/AXERA-TECH)
+`axcl-smi` 应能正常识别 AX8850；否则需要先检查驱动、Runtime 和硬件连接。
 
-### NPU 工具链
+### 3. 配置并编译
 
-提供了NPU工具链相关使用说明和获取方式
-  - [Pulsar2](https://pulsar2-docs.readthedocs.io/zh_CN/latest/)(Support AX650A/AX650N/AX630C/AX620Q)
+进入源码目录：
 
-## 技术讨论
+```cmd
+cd /d D:\axcl-samples
+```
 
-- Github issues
-- QQ 群: 139953715
+生成 Release 配置：
+
+```cmd
+cmake -S . -B build-win -G Ninja ^
+  -DCMAKE_BUILD_TYPE=Release ^
+  -DAXCL_DIR=D:\AXCL\axcl\out\axcl_win_x64 ^
+  -DOpenCV_DIR=D:\opencv\opencv\build\x64\vc16\lib
+```
+
+只编译 YOLO26 示例：
+
+```cmd
+cmake --build build-win --target axcl_yolo26 -j 4
+```
+
+生成的程序位于：
+
+```text
+build-win\examples\axcl\axcl_yolo26.exe
+```
+
+如果切换了编译器、SDK 或 OpenCV 路径，请先删除旧的 `build-win` 目录，再重新配置。
+
+### 4. 运行 YOLO26
+
+AX8850 使用 YOLO26 模型仓库 `ax650` 目录中的模型，首次验证建议使用 `yolo26n.axmodel`。
+
+运行前把 AXCL 和 OpenCV 的 DLL（动态链接库）目录临时加入 `PATH`：
+
+```cmd
+set "PATH=D:\AXCL\axcl\out\axcl_win_x64\bin;D:\opencv\opencv\build\x64\vc16\bin;%PATH%"
+```
+
+假设模型和图片位于 `D:\yolo26`：
+
+```cmd
+build-win\examples\axcl\axcl_yolo26.exe ^
+  -m D:\yolo26\yolo26n.axmodel ^
+  -i D:\yolo26\bus.jpg
+```
+
+默认结果图片为当前目录下的 `yolo26_out.jpg`。
+
+## Linux 编译简版
+
+确保 AXCL 头文件、运行库和 OpenCV 已安装。默认情况下，项目会从 `/usr/include/axcl` 和 `/usr/lib/axcl` 查找 AXCL。
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target axcl_yolo26 -j 4
+```
+
+运行示例：
+
+```bash
+./build/examples/axcl/axcl_yolo26 -m yolo26n.axmodel -i bus.jpg
+```
+
+## 常见问题
+
+| 现象 | 处理方式 |
+| --- | --- |
+| CMake 找不到 C/C++ 编译器 | 使用 Visual Studio 2022 Developer Command Prompt，并确认 `cl` 可用 |
+| 找不到 `OpenCVConfig.cmake` | 将 `OpenCV_DIR` 指向实际包含该文件的目录 |
+| 链接时报 `LNK1181` 或找不到 AXCL 库 | 确认 `AXCL_DIR\lib\libaxcl_rt.lib` 存在 |
+| 运行时提示缺少 DLL | 将 AXCL 和 OpenCV 的 `bin` 目录加入 `PATH` |
+| 程序无法发现 AX8850 | 先运行 `axcl-smi`，检查驱动、Runtime 和 PCIe 连接 |
+| 修改环境后仍使用旧配置 | 删除 `build-win` 后重新执行 CMake 配置 |
+
+遇到大量编译错误时，优先处理日志中的第一个 `error` 或 `fatal error`，后续错误通常是连锁结果。
+
+## 相关资源
+
+- [AXCL 在线文档](https://axcl-docs.readthedocs.io/zh-cn/latest/)
+- [AXCL Windows 环境配置](https://axcl-docs.readthedocs.io/zh-cn/latest/doc_guide_win_setup.html)
+- [AXCL-SMI 使用说明](https://axcl-docs.readthedocs.io/zh-cn/latest/doc_guide_axcl_smi.html)
+- [YOLO26 模型](https://huggingface.co/AXERA-TECH/yolo26)
+- [视觉模型集合](https://huggingface.co/collections/AXERA-TECH/vision-models-67b0bce92ddc61229e8e94ed)
+- [ModelScope](https://modelscope.cn/organization/AXERA-TECH)
+
+问题反馈可通过 GitHub Issues；技术交流群：QQ 139953715。

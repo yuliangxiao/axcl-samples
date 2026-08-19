@@ -317,7 +317,7 @@ namespace detection
                             class_index = i;
                             class_score = temp;
 
-                            if (temp >= prob_threshold and class_index != 0)
+                            if (temp >= prob_threshold && class_index != 0)
                             {
                                 // fprintf(stderr, "class_score: %f %d \n", class_score, i);
 
@@ -2606,7 +2606,7 @@ namespace detection
             int feat_h = letterbox_rows / stride;
             auto cls_ptr = cls_feat;
             auto boxes_ptr = box_feat;
-            int reg_max = 17;
+            constexpr int reg_max = 17;
             float dis_after_sm[reg_max];
 
             for (int h = 0; h < feat_h; h++)
@@ -2770,7 +2770,7 @@ namespace detection
             int feat_h = letterbox_rows / stride;
             auto cls_ptr = cls_feat;
             auto boxes_ptr = box_feat;
-            int reg_max = 16;
+            constexpr int reg_max = 16;
             float dis_after_sm[reg_max];
 
             for (int h = 0; h < feat_h; h++)
