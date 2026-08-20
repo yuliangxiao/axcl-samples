@@ -93,17 +93,6 @@ constexpr AX_VDEC_CHN kVdecChannel = 0;
 constexpr AX_U32 kH264FrameBufferCount = 32;
 constexpr AX_S32 kAxWaitMs = 100;
 
-const char* kClassNames[kClassCount] = {
-    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light",
-    "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
-    "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
-    "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard",
-    "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
-    "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch",
-    "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard", "cell phone",
-    "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors", "teddy bear",
-    "hair drier", "toothbrush"};
-
 enum class RunMode {
     kVdecSmoke,
     kIvpsSmoke,
@@ -1402,7 +1391,7 @@ public:
         return true;
     }
 
-    bool Run(std::uint64_t frame_index, std::uint64_t pts_us, int source_width, int source_height) {
+    bool Run(std::uint64_t frame_index, int source_width, int source_height) {
         if (!opened_) {
             ++statistics_.errors;
             return false;
@@ -1442,18 +1431,8 @@ public:
         statistics_.postprocess_total_ms += postprocess_ms;
 
         std::fprintf(stdout,
-                     "[DETECTION] frame=%llu pts_us=%llu objects=%zu inference_ms=%.3f postprocess_ms=%.3f\n",
-                     static_cast<unsigned long long>(frame_index), static_cast<unsigned long long>(pts_us),
-                     objects.size(), inference_ms, postprocess_ms);
-        for (const auto& object : objects) {
-            const char* class_name = object.label >= 0 && object.label < kClassCount
-                                         ? kClassNames[object.label]
-                                         : "unknown";
-            std::fprintf(stdout,
-                         "[OBJECT] class=%d name=%s confidence=%.4f bbox=[%.1f,%.1f,%.1f,%.1f]\n",
-                         object.label, class_name, object.prob, object.rect.x, object.rect.y,
-                         object.rect.width, object.rect.height);
-        }
+                     "[DETECTION] frame=%llu objects=%zu inference_ms=%.3f\n",
+                     static_cast<unsigned long long>(frame_index), objects.size(), inference_ms);
         return true;
     }
 
@@ -1685,7 +1664,7 @@ int Run(const Options& options) {
             raw_dump_written = true;
         }
         if (options.mode == RunMode::kInfer &&
-            !yolo.Run(vdec.statistics().decoded_frames, frame.stVFrame.u64PTS,
+            !yolo.Run(vdec.statistics().decoded_frames,
                       frame.stVFrame.u32Width, frame.stVFrame.u32Height)) {
             return false;
         }

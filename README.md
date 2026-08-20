@@ -209,7 +209,7 @@ build-native\examples\axcl\ax_yolo26_rtsp_native.exe --mode infer --duration 60 
 验收条件：
 
 - 启动日志包含 `direct device input bound`、`auto_sync_before=false` 和 `auto_sync_after=true`；
-- `infer_frames` 持续增加，`infer_errors=0`，并输出 `[DETECTION]`/`[OBJECT]`；
+- `infer_frames` 持续增加，`infer_errors=0`，并逐帧输出一行 `[DETECTION]` 摘要；
 - VDEC、IVPS、FFmpeg错误计数仍为 0；
 - 正式链路没有 Host 视频解码、resize、CSC或NPU输入H2D复制。
 
