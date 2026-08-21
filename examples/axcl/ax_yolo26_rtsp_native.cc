@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cerrno>
 #include <csignal>
+#include <condition_variable>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -102,9 +103,15 @@ constexpr int kClassCount = 80;
 constexpr float kProbabilityThreshold = 0.45F;
 constexpr float kNmsThreshold = 0.45F;
 constexpr AX_VDEC_CHN kVdecChannel = 0;
-constexpr AX_U32 kH264FrameBufferCount = 32;
+// Match the AXCL multi-group VDEC sample so four groups keep 32 output frames in total.
+constexpr AX_U32 kH264FrameBufferCount = 8;
 constexpr AX_S32 kAxWaitMs = 100;
 constexpr double kSlowVdecSendMilliseconds = 50.0;
+constexpr std::uint64_t kMaxConsecutiveVdecTaskTimeouts = 3;
+constexpr std::size_t kCameraCount = 4;
+constexpr double kInferenceLimitFps = 10.0;
+constexpr std::chrono::milliseconds kInferencePeriod{100};
+constexpr std::chrono::milliseconds kCameraPhaseStep{25};
 constexpr AX_S32 kAxclRuntimeTaskTimeout =
     AXCL_DEF_RUNTIME_ERR(AXCL_RUNTIME_TASK, AXCL_ERR_TIMEOUT);
 
@@ -119,6 +126,7 @@ std::array<char, 64U * 1024U> g_application_log_buffer{};
 FILE* g_original_standard_error = nullptr;
 std::string g_application_log_path;
 bool g_console_log_path_reported = false;
+thread_local int g_application_log_camera_id = -1;
 
 const char* ApplicationLogLevelName(ApplicationLogLevel level) {
     switch (level) {
@@ -179,21 +187,35 @@ std::string FormatLogMessage(const char* format, va_list arguments) {
     return std::string(buffer.data(), static_cast<std::size_t>(written));
 }
 
-void WriteApplicationLog(ApplicationLogLevel level, bool flush, const char* format, va_list arguments) {
+void WriteApplicationLog(ApplicationLogLevel level, bool flush, bool mirror_to_console,
+                         const char* format, va_list arguments) {
     const std::string message = FormatLogMessage(format, arguments);
     const std::string timestamp = WallClockTimestamp();
     const char* level_name = ApplicationLogLevelName(level);
 
     std::lock_guard<std::mutex> lock(g_application_log_mutex);
-    std::fprintf(stdout, "[%s][%s] %s\n", timestamp.c_str(), level_name, message.c_str());
+    if (g_application_log_camera_id >= 0) {
+        std::fprintf(stdout, "[%s][%s][camera=%d] %s\n", timestamp.c_str(), level_name,
+                     g_application_log_camera_id, message.c_str());
+    } else {
+        std::fprintf(stdout, "[%s][%s] %s\n", timestamp.c_str(), level_name, message.c_str());
+    }
     if (flush || level != ApplicationLogLevel::kInfo) {
         std::fflush(stdout);
     }
 
-    if (level == ApplicationLogLevel::kError && g_original_standard_error != nullptr) {
-        std::fprintf(g_original_standard_error, "[%s][%s] %s\n",
-                     timestamp.c_str(), level_name, message.c_str());
-        if (!g_console_log_path_reported && !g_application_log_path.empty()) {
+    if ((level == ApplicationLogLevel::kError || mirror_to_console) &&
+        g_original_standard_error != nullptr) {
+        if (g_application_log_camera_id >= 0) {
+            std::fprintf(g_original_standard_error, "[%s][%s][camera=%d] %s\n",
+                         timestamp.c_str(), level_name, g_application_log_camera_id,
+                         message.c_str());
+        } else {
+            std::fprintf(g_original_standard_error, "[%s][%s] %s\n",
+                         timestamp.c_str(), level_name, message.c_str());
+        }
+        if (level == ApplicationLogLevel::kError && !g_console_log_path_reported &&
+            !g_application_log_path.empty()) {
             std::fprintf(g_original_standard_error, "[LOG] %s\n", g_application_log_path.c_str());
             g_console_log_path_reported = true;
         }
@@ -204,30 +226,52 @@ void WriteApplicationLog(ApplicationLogLevel level, bool flush, const char* form
 void LogInfo(const char* format, ...) {
     va_list arguments;
     va_start(arguments, format);
-    WriteApplicationLog(ApplicationLogLevel::kInfo, false, format, arguments);
+    WriteApplicationLog(ApplicationLogLevel::kInfo, false, false, format, arguments);
     va_end(arguments);
 }
 
 void LogInfoFlush(const char* format, ...) {
     va_list arguments;
     va_start(arguments, format);
-    WriteApplicationLog(ApplicationLogLevel::kInfo, true, format, arguments);
+    WriteApplicationLog(ApplicationLogLevel::kInfo, true, false, format, arguments);
+    va_end(arguments);
+}
+
+void LogStatisticsFlush(const char* format, ...) {
+    va_list arguments;
+    va_start(arguments, format);
+    WriteApplicationLog(ApplicationLogLevel::kInfo, true, true, format, arguments);
     va_end(arguments);
 }
 
 void LogWarning(const char* format, ...) {
     va_list arguments;
     va_start(arguments, format);
-    WriteApplicationLog(ApplicationLogLevel::kWarning, true, format, arguments);
+    WriteApplicationLog(ApplicationLogLevel::kWarning, true, false, format, arguments);
     va_end(arguments);
 }
 
 void LogError(const char* format, ...) {
     va_list arguments;
     va_start(arguments, format);
-    WriteApplicationLog(ApplicationLogLevel::kError, true, format, arguments);
+    WriteApplicationLog(ApplicationLogLevel::kError, true, true, format, arguments);
     va_end(arguments);
 }
+
+class ScopedCameraLogContext final {
+public:
+    explicit ScopedCameraLogContext(int camera_id)
+        : previous_camera_id_(g_application_log_camera_id) {
+        g_application_log_camera_id = camera_id;
+    }
+
+    ~ScopedCameraLogContext() {
+        g_application_log_camera_id = previous_camera_id_;
+    }
+
+private:
+    int previous_camera_id_{-1};
+};
 
 std::string PathForLog(const fs::path& path) {
     return path.u8string();
@@ -533,21 +577,24 @@ struct Options {
     int device_index{0};
     int duration_seconds{0};
     int read_timeout_ms{5000};
-    int statistics_interval_seconds{5};
+    int statistics_interval_seconds{1};
 };
 
 struct InterruptState {
-    std::atomic<bool> stop{false};
+    explicit InterruptState(const std::atomic<bool>* stop_requested = nullptr)
+        : stop_requested(stop_requested) {}
+
+    const std::atomic<bool>* stop_requested{nullptr};
     std::atomic<std::int64_t> deadline_us{0};
 };
 
-InterruptState* g_interrupt_state = nullptr;
+std::atomic<bool>* g_stop_requested = nullptr;
 
 #ifdef _WIN32
 BOOL WINAPI ConsoleControlHandler(DWORD event) {
     if (event == CTRL_C_EVENT || event == CTRL_BREAK_EVENT || event == CTRL_CLOSE_EVENT) {
-        if (g_interrupt_state != nullptr) {
-            g_interrupt_state->stop.store(true, std::memory_order_relaxed);
+        if (g_stop_requested != nullptr) {
+            g_stop_requested->store(true, std::memory_order_relaxed);
         }
         return TRUE;
     }
@@ -555,8 +602,8 @@ BOOL WINAPI ConsoleControlHandler(DWORD event) {
 }
 #else
 void SignalHandler(int) {
-    if (g_interrupt_state != nullptr) {
-        g_interrupt_state->stop.store(true, std::memory_order_relaxed);
+    if (g_stop_requested != nullptr) {
+        g_stop_requested->store(true, std::memory_order_relaxed);
     }
 }
 #endif
@@ -631,7 +678,8 @@ int FfmpegInterruptCallback(void* opaque) {
     if (state == nullptr) {
         return 0;
     }
-    if (state->stop.load(std::memory_order_relaxed)) {
+    if (state->stop_requested != nullptr &&
+        state->stop_requested->load(std::memory_order_relaxed)) {
         return 1;
     }
     const auto deadline = state->deadline_us.load(std::memory_order_relaxed);
@@ -856,7 +904,8 @@ public:
             timeout_us > 0 ? av_gettime_relative() + timeout_us : 0;
 
         while (true) {
-            if (interrupt_ != nullptr && interrupt_->stop.load(std::memory_order_relaxed)) {
+            if (interrupt_ != nullptr && interrupt_->stop_requested != nullptr &&
+                interrupt_->stop_requested->load(std::memory_order_relaxed)) {
                 return ReadResult::kInterrupted;
             }
             if (deadline_us != 0 && av_gettime_relative() >= deadline_us) {
@@ -946,6 +995,12 @@ public:
     std::uint64_t skipped_before_idr() const { return skipped_before_idr_; }
     std::uint64_t ffmpeg_errors() const { return ffmpeg_errors_; }
 
+    void RequestIdrResync() {
+        waiting_for_idr_ = true;
+        pre_idr_parameter_sets_.clear();
+        LogWarning("[FFMPEG] VDEC send result was not confirmed; waiting for the next IDR");
+    }
+
 private:
     bool InitializeMp4ToAnnexB() {
         const AVBitStreamFilter* filter = av_bsf_get_by_name("h264_mp4toannexb");
@@ -975,7 +1030,8 @@ private:
 
     ReadResult ReadSelectedPacket(std::int64_t deadline_us) {
         while (true) {
-            if (interrupt_ != nullptr && interrupt_->stop.load(std::memory_order_relaxed)) {
+            if (interrupt_ != nullptr && interrupt_->stop_requested != nullptr &&
+                interrupt_->stop_requested->load(std::memory_order_relaxed)) {
                 return ReadResult::kInterrupted;
             }
             if (deadline_us != 0 && av_gettime_relative() >= deadline_us) {
@@ -990,7 +1046,9 @@ private:
             if (ret == AVERROR_EOF) {
                 return ReadResult::kEof;
             }
-            if (ret == AVERROR_EXIT || (interrupt_ != nullptr && interrupt_->stop.load(std::memory_order_relaxed))) {
+            if (ret == AVERROR_EXIT ||
+                (interrupt_ != nullptr && interrupt_->stop_requested != nullptr &&
+                 interrupt_->stop_requested->load(std::memory_order_relaxed))) {
                 return ReadResult::kInterrupted;
             }
             if (ret < 0) {
@@ -998,7 +1056,8 @@ private:
                 LogError("[FFMPEG] av_read_frame failed: %s (%d)", AvErrorText(ret).c_str(), ret);
                 return ReadResult::kError;
             }
-            if (interrupt_ != nullptr && interrupt_->stop.load(std::memory_order_relaxed)) {
+            if (interrupt_ != nullptr && interrupt_->stop_requested != nullptr &&
+                interrupt_->stop_requested->load(std::memory_order_relaxed)) {
                 av_packet_unref(packet_);
                 return ReadResult::kInterrupted;
             }
@@ -1194,7 +1253,7 @@ public:
         sys_initialized_ = true;
 
         AX_VDEC_MOD_ATTR_T vdec_attr{};
-        vdec_attr.u32MaxGroupCount = 1;
+        vdec_attr.u32MaxGroupCount = static_cast<AX_U32>(kCameraCount);
         if (const auto ret = AXCL_VDEC_Init(&vdec_attr); ret != AX_SUCCESS) {
             LogError("[AXCL] AXCL_VDEC_Init failed: 0x%08X", static_cast<unsigned int>(ret));
             (void)Shutdown();
@@ -1237,6 +1296,8 @@ public:
         }
         return true;
     }
+
+    int runtime_device_id() const { return runtime_device_id_; }
 
     bool Shutdown() {
         bool successful = true;
@@ -1289,6 +1350,65 @@ private:
     bool engine_initialized_{false};
 };
 
+class AxclThreadContext final {
+public:
+    AxclThreadContext() = default;
+
+    ~AxclThreadContext() {
+        (void)Close();
+    }
+
+    bool Open(int runtime_device_id) {
+        (void)Close();
+        const auto create_ret = axclrtCreateContext(&context_, runtime_device_id);
+        if (create_ret != AXCL_SUCC || context_ == nullptr) {
+            LogError("[AXCL] worker axclrtCreateContext failed: 0x%08X",
+                     static_cast<unsigned int>(create_ret));
+            context_ = nullptr;
+            return false;
+        }
+        return Bind();
+    }
+
+    bool Bind() const {
+        if (context_ == nullptr) {
+            LogError("[AXCL] worker cannot bind a null context");
+            return false;
+        }
+        const auto ret = axclrtSetCurrentContext(context_);
+        if (ret != AXCL_SUCC) {
+            LogError("[AXCL] worker axclrtSetCurrentContext failed: 0x%08X",
+                     static_cast<unsigned int>(ret));
+            return false;
+        }
+        return true;
+    }
+
+    bool Close() {
+        if (context_ == nullptr) {
+            return true;
+        }
+        bool successful = true;
+        const auto bind_ret = axclrtSetCurrentContext(context_);
+        if (bind_ret != AXCL_SUCC) {
+            LogError("[CLEANUP] worker axclrtSetCurrentContext failed: 0x%08X",
+                     static_cast<unsigned int>(bind_ret));
+            successful = false;
+        }
+        const auto destroy_ret = axclrtDestroyContext(context_);
+        if (destroy_ret != AXCL_SUCC) {
+            LogError("[CLEANUP] worker axclrtDestroyContext failed: 0x%08X",
+                     static_cast<unsigned int>(destroy_ret));
+            successful = false;
+        }
+        context_ = nullptr;
+        return successful;
+    }
+
+private:
+    axclrtContext context_{nullptr};
+};
+
 struct VdecStatistics {
     std::uint64_t attempted_access_units{0};
     std::uint64_t sent_access_units{0};
@@ -1296,6 +1416,10 @@ struct VdecStatistics {
     std::uint64_t send_calls{0};
     std::uint64_t send_failures{0};
     std::uint64_t send_runtime_timeouts{0};
+    std::uint64_t recovered_task_timeouts{0};
+    std::uint64_t unrecovered_task_timeouts{0};
+    std::uint64_t consecutive_task_timeouts{0};
+    std::uint64_t max_consecutive_task_timeouts{0};
     std::uint64_t slow_send_calls{0};
     std::uint64_t send_full_retries{0};
     std::uint64_t failure_events{0};
@@ -1309,6 +1433,12 @@ struct VdecStatistics {
     AX_U32 last_width{0};
     AX_U32 last_height{0};
     AX_IMG_FORMAT_E last_format{AX_FORMAT_INVALID};
+};
+
+enum class VdecSendResult {
+    kSuccess,
+    kNeedsIdrResync,
+    kFatal,
 };
 
 class NativeVdec final {
@@ -1406,14 +1536,14 @@ public:
         return true;
     }
 
-    bool Send(const AccessUnit& access_unit, const FrameHandler& handler) {
+    VdecSendResult Send(const AccessUnit& access_unit, const FrameHandler& handler) {
         const std::uint64_t access_unit_sequence = ++statistics_.attempted_access_units;
         if (group_ < 0 || access_unit.data.empty() ||
             access_unit.data.size() > static_cast<std::size_t>(std::numeric_limits<AX_U32>::max())) {
             ++statistics_.errors;
             LogError("[VDEC] invalid access unit: au_seq=%llu group=%d bytes=%zu",
                      static_cast<unsigned long long>(access_unit_sequence), group_, access_unit.data.size());
-            return false;
+            return VdecSendResult::kFatal;
         }
 
         AX_VDEC_STREAM_T stream{};
@@ -1429,26 +1559,35 @@ public:
         while (!StopRequested()) {
             const SendCallResult call = CallSendStream(stream, "data", access_unit_sequence, retry_index);
             if (call.result == AX_SUCCESS) {
+                statistics_.consecutive_task_timeouts = 0;
                 ++statistics_.sent_access_units;
-                return DrainAvailable(handler, 0, nullptr);
+                return DrainAvailable(handler, 0, nullptr) ? VdecSendResult::kSuccess
+                                                           : VdecSendResult::kFatal;
+            }
+            if (call.result == kAxclRuntimeTaskTimeout) {
+                return RecoverRuntimeTaskTimeout(call, stream, access_unit_sequence,
+                                                 retry_index, handler);
             }
             if (!IsBufferPressure(call.result)) {
                 ++statistics_.errors;
-                RecordSendFailure(call, stream, "data", access_unit_sequence, retry_index);
-                return false;
+                const std::uint64_t failure_event_id =
+                    RecordSendFailure(call, stream, "data", access_unit_sequence, retry_index);
+                AX_VDEC_GRP_STATUS_T status{};
+                (void)QueryFailureStatusSnapshot(failure_event_id, &status);
+                return VdecSendResult::kFatal;
             }
 
             ++statistics_.send_full_retries;
             ++retry_index;
             bool received = false;
             if (!DrainAvailable(handler, kAxWaitMs, &received)) {
-                return false;
+                return VdecSendResult::kFatal;
             }
             if (!received) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
         }
-        return false;
+        return VdecSendResult::kFatal;
     }
 
     bool Finish(const FrameHandler& handler) {
@@ -1465,12 +1604,19 @@ public:
         while (Clock::now() < send_deadline) {
             const SendCallResult call = CallSendStream(stream, "eos", 0, retry_index);
             if (call.result == AX_SUCCESS || call.result == AX_ERR_VDEC_FLOW_END) {
+                statistics_.consecutive_task_timeouts = 0;
                 eos_sent = true;
                 break;
             }
             if (!IsBufferPressure(call.result)) {
                 ++statistics_.errors;
-                RecordSendFailure(call, stream, "eos", 0, retry_index);
+                const std::uint64_t failure_event_id =
+                    RecordSendFailure(call, stream, "eos", 0, retry_index);
+                if (call.result == kAxclRuntimeTaskTimeout) {
+                    ++statistics_.unrecovered_task_timeouts;
+                }
+                AX_VDEC_GRP_STATUS_T status{};
+                (void)QueryFailureStatusSnapshot(failure_event_id, &status);
                 return false;
             }
             ++statistics_.send_full_retries;
@@ -1575,9 +1721,9 @@ private:
         return call;
     }
 
-    void RecordSendFailure(const SendCallResult& call, const AX_VDEC_STREAM_T& stream,
-                           const char* kind, std::uint64_t access_unit_sequence,
-                           std::uint64_t retry_index) {
+    std::uint64_t RecordSendFailure(const SendCallResult& call, const AX_VDEC_STREAM_T& stream,
+                                    const char* kind, std::uint64_t access_unit_sequence,
+                                    std::uint64_t retry_index) {
         ++statistics_.send_failures;
         if (call.elapsed_ms >= kSlowVdecSendMilliseconds) {
             ++statistics_.slow_send_calls;
@@ -1585,6 +1731,10 @@ private:
         const bool runtime_task_timeout = call.result == kAxclRuntimeTaskTimeout;
         if (runtime_task_timeout) {
             ++statistics_.send_runtime_timeouts;
+            ++statistics_.consecutive_task_timeouts;
+            statistics_.max_consecutive_task_timeouts =
+                std::max(statistics_.max_consecutive_task_timeouts,
+                         statistics_.consecutive_task_timeouts);
         }
         const std::uint64_t failure_event_id = ++statistics_.failure_events;
         const std::uint32_t code = static_cast<std::uint32_t>(call.result);
@@ -1605,36 +1755,107 @@ private:
                  static_cast<unsigned long long>(statistics_.sent_access_units),
                  static_cast<unsigned long long>(statistics_.decoded_frames),
                  static_cast<unsigned long long>(statistics_.send_full_retries));
-        LogFailureStatusSnapshot(failure_event_id);
+        return failure_event_id;
     }
 
-    void LogFailureStatusSnapshot(std::uint64_t failure_event_id) {
-        AX_VDEC_GRP_STATUS_T status{};
+    bool QueryFailureStatusSnapshot(std::uint64_t failure_event_id,
+                                    AX_VDEC_GRP_STATUS_T* status) {
+        if (status == nullptr) {
+            return false;
+        }
         const auto begin = Clock::now();
-        const AX_S32 result = AXCL_VDEC_QueryStatus(group_, &status);
+        const AX_S32 result = AXCL_VDEC_QueryStatus(group_, status);
         const double query_ms = ElapsedMilliseconds(begin);
         if (result != AX_SUCCESS) {
             LogError("[VDEC] fault QueryStatus failed: event=%llu query_ms=%.3f ret=0x%08X",
                      static_cast<unsigned long long>(failure_event_id), query_ms,
                      static_cast<unsigned int>(result));
-            return;
+            return false;
         }
 
-        UpdateStatusStatistics(status);
-        const auto& error = status.stVdecDecErr;
+        UpdateStatusStatistics(*status);
+        const auto& error = status->stVdecDecErr;
         LogInfoFlush("[VDEC][FAULT_STATUS] event=%llu query_ms=%.3f left_bytes=%u left_frames=%u "
                      "left_pics=%u started=%d recv_frames=%u decoded_stream_frames=%u size=%ux%u "
                      "input_fifo_full=%d format_err=%d pic_size_err=%d stream_unsupported=%d "
                      "pack_err=%d ref_err=%d pic_buf_size_err=%d stream_size_over=%d "
                      "stream_not_release=%d",
                      static_cast<unsigned long long>(failure_event_id), query_ms,
-                     status.u32LeftStreamBytes, status.u32LeftStreamFrames,
-                     status.u32LeftPics[kVdecChannel], static_cast<int>(status.bStartRecvStream),
-                     status.u32RecvStreamFrames, status.u32DecodeStreamFrames,
-                     status.u32PicWidth, status.u32PicHeight, static_cast<int>(status.bInputFifoIsFull),
+                     status->u32LeftStreamBytes, status->u32LeftStreamFrames,
+                     status->u32LeftPics[kVdecChannel], static_cast<int>(status->bStartRecvStream),
+                     status->u32RecvStreamFrames, status->u32DecodeStreamFrames,
+                     status->u32PicWidth, status->u32PicHeight,
+                     static_cast<int>(status->bInputFifoIsFull),
                      error.s32FormatErr, error.s32PicSizeErrSet, error.s32StreamUnsprt,
                      error.s32PackErr, error.s32RefErrSet, error.s32PicBufSizeErrSet,
                      error.s32StreamSizeOver, error.s32VdecStreamNotRelease);
+        return true;
+    }
+
+    VdecSendResult RecoverRuntimeTaskTimeout(const SendCallResult& call,
+                                             const AX_VDEC_STREAM_T& stream,
+                                             std::uint64_t access_unit_sequence,
+                                             std::uint64_t retry_index,
+                                             const FrameHandler& handler) {
+        // The device may have accepted this AU even though the Host task response timed out.
+        // Re-sending it would duplicate input, so reconcile against the device counters instead.
+        const std::uint64_t failure_event_id =
+            RecordSendFailure(call, stream, "data", access_unit_sequence, retry_index);
+
+        AX_VDEC_GRP_STATUS_T status{};
+        if (!QueryFailureStatusSnapshot(failure_event_id, &status)) {
+            ++statistics_.unrecovered_task_timeouts;
+            ++statistics_.errors;
+            LogError("[VDEC] task timeout is unrecoverable: event=%llu reason=status-query-failed",
+                     static_cast<unsigned long long>(failure_event_id));
+            return VdecSendResult::kFatal;
+        }
+
+        const bool healthy = status.bStartRecvStream != AX_FALSE &&
+                             status.bInputFifoIsFull == AX_FALSE &&
+                             statistics_.hardware_decode_errors == 0;
+        const std::uint64_t expected_received_frames = statistics_.sent_access_units + 1;
+        const bool accepted =
+            static_cast<std::uint64_t>(status.u32RecvStreamFrames) >= expected_received_frames;
+        const bool timeout_limit_reached =
+            statistics_.consecutive_task_timeouts >= kMaxConsecutiveVdecTaskTimeouts;
+
+        if (accepted) {
+            ++statistics_.sent_access_units;
+        }
+
+        if (!healthy || timeout_limit_reached) {
+            ++statistics_.unrecovered_task_timeouts;
+            ++statistics_.errors;
+            LogError("[VDEC] task timeout is unrecoverable: event=%llu healthy=%d "
+                     "consecutive=%llu limit=%llu",
+                     static_cast<unsigned long long>(failure_event_id), healthy ? 1 : 0,
+                     static_cast<unsigned long long>(statistics_.consecutive_task_timeouts),
+                     static_cast<unsigned long long>(kMaxConsecutiveVdecTaskTimeouts));
+            return VdecSendResult::kFatal;
+        }
+
+        if (!DrainAvailable(handler, 0, nullptr)) {
+            ++statistics_.unrecovered_task_timeouts;
+            return VdecSendResult::kFatal;
+        }
+
+        ++statistics_.recovered_task_timeouts;
+        if (accepted) {
+            LogWarning("[VDEC] task timeout recovered: event=%llu action=accept-confirmed "
+                       "device_recv_frames=%u expected_recv_frames=%llu",
+                       static_cast<unsigned long long>(failure_event_id),
+                       status.u32RecvStreamFrames,
+                       static_cast<unsigned long long>(expected_received_frames));
+            return VdecSendResult::kSuccess;
+        }
+
+        LogWarning("[VDEC] task timeout recovered: event=%llu action=wait-for-idr "
+                   "device_recv_frames=%u expected_recv_frames=%llu",
+                   static_cast<unsigned long long>(failure_event_id),
+                   status.u32RecvStreamFrames,
+                   static_cast<unsigned long long>(expected_received_frames));
+        return VdecSendResult::kNeedsIdrResync;
     }
 
     void UpdateStatusStatistics(const AX_VDEC_GRP_STATUS_T& status) {
@@ -1920,7 +2141,7 @@ public:
         Close();
     }
 
-    bool Open(const std::string& model, AX_U64 input_physical_address, std::size_t input_bytes) {
+    bool Open(const std::string& model, std::size_t input_bytes) {
         Close();
         if (runner_.init(model.c_str()) != 0) {
             LogError("[YOLO26] runner.init failed: %s", model.c_str());
@@ -1951,24 +2172,48 @@ public:
             Close();
             return false;
         }
-
-        const int bind_ret = runner_.set_input(kModelGroupId, 0, input_physical_address,
-                                               static_cast<unsigned long>(input_bytes));
-        if (bind_ret != 0) {
-            LogError("[YOLO26] direct IVPS CMM -> runner.set_input binding failed: 0x%08X",
-                     static_cast<unsigned int>(bind_ret));
+        if (input.phyAddr == 0) {
+            LogError("[YOLO26] runner input has no device address");
             Close();
             return false;
         }
+
+        input_physical_address_ = static_cast<AX_U64>(input.phyAddr);
+        input_bytes_ = input_bytes;
         runner_.set_auto_sync_before_inference(false);
         runner_.set_auto_sync_after_inference(true);
-        LogInfo("[YOLO26] direct device input bound: phy=0x%llx bytes=%zu "
+        LogInfo("[YOLO26] fixed runner input ready: phy=0x%llx bytes=%zu "
                 "auto_sync_before=false auto_sync_after=true",
-                static_cast<unsigned long long>(input_physical_address), input_bytes);
+                static_cast<unsigned long long>(input_physical_address_), input_bytes_);
         return true;
     }
 
-    bool Run(std::uint64_t frame_index, int source_width, int source_height) {
+    bool CopyInput(AX_U64 source_physical_address, std::size_t source_bytes) {
+        if (!opened_ || input_physical_address_ == 0 || source_physical_address == 0 ||
+            source_bytes != input_bytes_) {
+            ++statistics_.errors;
+            LogError("[YOLO26] invalid D2D input copy: opened=%d source=0x%llx bytes=%zu "
+                     "expected=%zu",
+                     static_cast<int>(opened_),
+                     static_cast<unsigned long long>(source_physical_address), source_bytes,
+                     input_bytes_);
+            return false;
+        }
+        const auto ret = axclrtMemcpy(
+            reinterpret_cast<void*>(static_cast<std::uintptr_t>(input_physical_address_)),
+            reinterpret_cast<const void*>(static_cast<std::uintptr_t>(source_physical_address)),
+            input_bytes_, AXCL_MEMCPY_DEVICE_TO_DEVICE);
+        if (ret != AXCL_SUCC) {
+            ++statistics_.errors;
+            LogError("[YOLO26] BGR input D2D copy failed: 0x%08X",
+                     static_cast<unsigned int>(ret));
+            return false;
+        }
+        return true;
+    }
+
+    bool Run(std::size_t camera_id, std::uint64_t frame_index,
+             int source_width, int source_height, std::size_t* object_count) {
         if (!opened_) {
             ++statistics_.errors;
             LogError("[YOLO26] inference requested before model was opened");
@@ -1976,7 +2221,7 @@ public:
         }
 
         if (!warmed_up_) {
-            LogInfo("[YOLO26] warmup %d times using the IVPS device buffer", kWarmupCount);
+            LogInfo("[YOLO26] warmup %d times using the shared runner input", kWarmupCount);
             for (int index = 0; index < kWarmupCount; ++index) {
                 if (const int ret = runner_.inference(kModelGroupId); ret != 0) {
                     ++statistics_.errors;
@@ -2008,9 +2253,12 @@ public:
         ++statistics_.frames;
         statistics_.inference_total_ms += inference_ms;
         statistics_.postprocess_total_ms += postprocess_ms;
+        if (object_count != nullptr) {
+            *object_count = objects.size();
+        }
 
-        LogInfo("[DETECTION] frame=%llu objects=%zu inference_ms=%.3f",
-                static_cast<unsigned long long>(frame_index), objects.size(), inference_ms);
+        LogInfo("[DETECTION] camera=%zu frame=%llu objects=%zu inference_ms=%.3f",
+                camera_id, static_cast<unsigned long long>(frame_index), objects.size(), inference_ms);
         return true;
     }
 
@@ -2020,6 +2268,8 @@ public:
             opened_ = false;
         }
         warmed_up_ = false;
+        input_physical_address_ = 0;
+        input_bytes_ = 0;
     }
 
     const InferenceStatistics& statistics() const { return statistics_; }
@@ -2028,67 +2278,611 @@ private:
     ax_runner_axcl runner_;
     bool opened_{false};
     bool warmed_up_{false};
+    AX_U64 input_physical_address_{0};
+    std::size_t input_bytes_{0};
     InferenceStatistics statistics_{};
 };
 
-void PrintStatistics(const Options& options, Clock::time_point started,
-                     const FfmpegRtspDemuxer& demuxer, NativeVdec& vdec,
-                     const NativeIvpsPreprocessor* ivps, const Yolo26Inference* yolo,
-                     const char* tag) {
-    (void)vdec.RefreshStatus();
-    const double elapsed = std::max(ElapsedSeconds(started), 0.001);
-    const auto& decode = vdec.statistics();
-    const double decoded_fps = static_cast<double>(decode.decoded_frames) / elapsed;
-    const double send_average_ms = decode.send_calls == 0
-                                       ? 0.0
-                                       : decode.send_total_ms / static_cast<double>(decode.send_calls);
-    const std::uint64_t ivps_frames = ivps == nullptr ? 0 : ivps->statistics().frames;
-    const std::uint64_t ivps_errors = ivps == nullptr ? 0 : ivps->statistics().errors;
-    const std::uint64_t inference_frames = yolo == nullptr ? 0 : yolo->statistics().frames;
-    const std::uint64_t inference_errors = yolo == nullptr ? 0 : yolo->statistics().errors;
-    const double ivps_average_ms = ivps_frames == 0
-                                       ? 0.0
-                                       : ivps->statistics().total_ms / static_cast<double>(ivps_frames);
-    const double inference_average_ms = inference_frames == 0
-                                            ? 0.0
-                                            : yolo->statistics().inference_total_ms /
-                                                  static_cast<double>(inference_frames);
-    const double postprocess_average_ms = inference_frames == 0
-                                              ? 0.0
-                                              : yolo->statistics().postprocess_total_ms /
-                                                    static_cast<double>(inference_frames);
+enum class CameraRunState {
+    kStarting,
+    kReady,
+    kRunning,
+    kFailed,
+    kStopped,
+};
 
-    LogInfoFlush("[%s] mode=%s elapsed=%.2fs input_packets=%llu attempted_au=%llu sent_au=%llu "
-                 "decoded_frames=%llu decoded_fps=%.2f frame=%ux%u format=%d pts_us=%llu "
-                 "vdec_errors=%llu send_calls=%llu send_failures=%llu send_task_timeouts=%llu "
-                 "slow_sends=%llu full_retries=%llu send_avg_ms=%.3f send_max_ms=%.3f "
-                 "vdec_hw_errors=%llu pending_au=%u pending_frames=%u "
-                 "ivps_frames=%llu ivps_errors=%llu ivps_avg_ms=%.3f "
-                 "infer_frames=%llu infer_errors=%llu infer_avg_ms=%.3f post_avg_ms=%.3f "
-                 "ffmpeg_errors=%llu skipped_before_idr=%llu",
-                 tag, ModeName(options.mode), elapsed,
-                 static_cast<unsigned long long>(demuxer.input_packets()),
-                 static_cast<unsigned long long>(decode.attempted_access_units),
-                 static_cast<unsigned long long>(decode.sent_access_units),
-                 static_cast<unsigned long long>(decode.decoded_frames), decoded_fps,
-                 decode.last_width, decode.last_height, static_cast<int>(decode.last_format),
-                 static_cast<unsigned long long>(decode.last_pts_us),
-                 static_cast<unsigned long long>(decode.errors),
-                 static_cast<unsigned long long>(decode.send_calls),
-                 static_cast<unsigned long long>(decode.send_failures),
-                 static_cast<unsigned long long>(decode.send_runtime_timeouts),
-                 static_cast<unsigned long long>(decode.slow_send_calls),
-                 static_cast<unsigned long long>(decode.send_full_retries),
-                 send_average_ms, decode.send_max_ms,
-                 static_cast<unsigned long long>(decode.hardware_decode_errors),
-                 decode.left_stream_frames, decode.left_output_frames,
-                 static_cast<unsigned long long>(ivps_frames),
-                 static_cast<unsigned long long>(ivps_errors), ivps_average_ms,
-                 static_cast<unsigned long long>(inference_frames),
-                 static_cast<unsigned long long>(inference_errors),
-                 inference_average_ms, postprocess_average_ms,
-                 static_cast<unsigned long long>(demuxer.ffmpeg_errors()),
-                 static_cast<unsigned long long>(demuxer.skipped_before_idr()));
+const char* CameraRunStateName(CameraRunState state) {
+    switch (state) {
+    case CameraRunState::kStarting:
+        return "starting";
+    case CameraRunState::kReady:
+        return "ready";
+    case CameraRunState::kRunning:
+        return "running";
+    case CameraRunState::kFailed:
+        return "failed";
+    case CameraRunState::kStopped:
+        return "stopped";
+    }
+    return "unknown";
+}
+
+struct RouteSnapshot {
+    CameraRunState state{CameraRunState::kStarting};
+    std::uint64_t input_packets{0};
+    std::uint64_t skipped_before_idr{0};
+    std::uint64_t ffmpeg_errors{0};
+    VdecStatistics vdec{};
+    IvpsStatistics ivps{};
+    std::uint64_t rate_skips{0};
+    std::uint64_t busy_drops{0};
+    std::uint64_t latest_replacements{0};
+};
+
+struct FrameSlotMetadata {
+    std::uint64_t decoded_frame_index{0};
+    int source_width{0};
+    int source_height{0};
+};
+
+class CameraRoute final {
+public:
+    CameraRoute(std::size_t camera_id, const std::atomic<bool>* stop_requested)
+        : camera_id(camera_id), interrupt(stop_requested), demuxer(&interrupt),
+          vdec(stop_requested) {}
+
+    CameraRoute(const CameraRoute&) = delete;
+    CameraRoute& operator=(const CameraRoute&) = delete;
+
+    void PublishSnapshot(CameraRunState next_state) {
+        state = next_state;
+        RouteSnapshot next{};
+        next.state = state;
+        next.input_packets = demuxer.input_packets();
+        next.skipped_before_idr = demuxer.skipped_before_idr();
+        next.ffmpeg_errors = demuxer.ffmpeg_errors();
+        next.vdec = vdec.statistics();
+        next.ivps = ivps.statistics();
+        next.rate_skips = rate_skips;
+        next.busy_drops = busy_drops;
+        next.latest_replacements = latest_replacements;
+        std::lock_guard<std::mutex> lock(snapshot_mutex);
+        snapshot = next;
+    }
+
+    RouteSnapshot ReadSnapshot() const {
+        std::lock_guard<std::mutex> lock(snapshot_mutex);
+        return snapshot;
+    }
+
+    const std::size_t camera_id;
+    InterruptState interrupt;
+    FfmpegRtspDemuxer demuxer;
+    NativeVdec vdec;
+    NativeIvpsPreprocessor ivps;
+
+    mutable std::mutex slot_mutex;
+    bool slot_writing{false};
+    bool slot_ready{false};
+    bool slot_copying{false};
+    FrameSlotMetadata slot_metadata{};
+
+    Clock::time_point next_candidate{};
+    std::uint64_t rate_skips{0};
+    std::uint64_t busy_drops{0};
+    std::uint64_t latest_replacements{0};
+    bool raw_dump_written{false};
+
+    std::atomic<std::uint64_t> inference_frames{0};
+    std::atomic<std::uint64_t> inference_errors{0};
+    std::atomic<std::uint64_t> detections{0};
+
+private:
+    CameraRunState state{CameraRunState::kStarting};
+    mutable std::mutex snapshot_mutex;
+    RouteSnapshot snapshot{};
+};
+
+class StartupGate final {
+public:
+    void Report(bool successful) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++reported_;
+        successful_ = successful_ && successful;
+        condition_.notify_all();
+    }
+
+    bool WaitForAll(std::size_t expected) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        condition_.wait(lock, [&] { return reported_ >= expected; });
+        return successful_;
+    }
+
+    bool WaitForRelease() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        condition_.wait(lock, [&] { return released_; });
+        return run_;
+    }
+
+    void Release(bool run) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        run_ = run;
+        released_ = true;
+        condition_.notify_all();
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    std::size_t reported_{0};
+    bool successful_{true};
+    bool released_{false};
+    bool run_{false};
+};
+
+class InferenceScheduler final {
+public:
+    void Notify() {
+        generation.fetch_add(1, std::memory_order_release);
+        condition.notify_all();
+    }
+
+    std::mutex mutex;
+    std::condition_variable condition;
+    std::atomic<std::uint64_t> generation{0};
+};
+
+class InferenceSharedState final {
+public:
+    void Publish(const InferenceStatistics& next) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        statistics_ = next;
+    }
+
+    InferenceStatistics Read() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return statistics_;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    InferenceStatistics statistics_{};
+};
+
+struct StatisticsTracker {
+    Clock::time_point previous_time{};
+    std::array<std::uint64_t, kCameraCount> decoded_frames{};
+    std::array<std::uint64_t, kCameraCount> inference_frames{};
+    std::array<std::uint64_t, kCameraCount> rate_skips{};
+    std::array<std::uint64_t, kCameraCount> busy_drops{};
+    std::uint64_t total_inference_frames{0};
+    double inference_total_ms{0.0};
+};
+
+std::uint64_t CounterDelta(std::uint64_t current, std::uint64_t previous) {
+    return current >= previous ? current - previous : current;
+}
+
+double CounterDelta(double current, double previous) {
+    return current >= previous ? current - previous : current;
+}
+
+void RequestGlobalFailure(std::atomic<bool>* stop_requested, std::atomic<bool>* failed,
+                          InferenceScheduler* scheduler,
+                          std::condition_variable* lifecycle_condition) {
+    failed->store(true, std::memory_order_relaxed);
+    stop_requested->store(true, std::memory_order_relaxed);
+    scheduler->Notify();
+    lifecycle_condition->notify_all();
+}
+
+void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_device_id,
+                    Clock::time_point* processing_started, StartupGate* startup_gate,
+                    InferenceScheduler* scheduler, std::atomic<bool>* stop_requested,
+                    std::atomic<bool>* failed,
+                    std::condition_variable* lifecycle_condition) {
+    ScopedCameraLogContext log_context(static_cast<int>(route->camera_id));
+    AxclThreadContext thread_context;
+    bool startup_reported = false;
+    bool route_failed = false;
+
+    try {
+        if (!thread_context.Open(runtime_device_id) ||
+            !route->demuxer.Open(options->source, options->read_timeout_ms)) {
+            route->PublishSnapshot(CameraRunState::kFailed);
+            startup_gate->Report(false);
+            startup_reported = true;
+            return;
+        }
+        route->PublishSnapshot(CameraRunState::kReady);
+        startup_gate->Report(true);
+        startup_reported = true;
+        if (!startup_gate->WaitForRelease()) {
+            route->PublishSnapshot(CameraRunState::kStopped);
+            (void)thread_context.Close();
+            return;
+        }
+
+        route->next_candidate = *processing_started +
+                                kCameraPhaseStep * static_cast<int>(route->camera_id);
+        route->PublishSnapshot(CameraRunState::kRunning);
+        auto next_status_refresh = Clock::now() + std::chrono::seconds(1);
+
+        const NativeVdec::FrameHandler frame_handler = [&](const AX_VIDEO_FRAME_INFO_T& frame) {
+            if (frame.stVFrame.u32Width != kSourceWidth ||
+                frame.stVFrame.u32Height != kSourceHeight ||
+                frame.stVFrame.enImgFormat != AX_FORMAT_YUV420_SEMIPLANAR) {
+                LogError("[VDEC] unexpected frame: %ux%u format=%d pts=%llu",
+                         frame.stVFrame.u32Width, frame.stVFrame.u32Height,
+                         static_cast<int>(frame.stVFrame.enImgFormat),
+                         static_cast<unsigned long long>(frame.stVFrame.u64PTS));
+                return false;
+            }
+            if (options->mode == RunMode::kVdecSmoke ||
+                stop_requested->load(std::memory_order_relaxed)) {
+                return true;
+            }
+
+            const auto now = Clock::now();
+            if (now < route->next_candidate) {
+                ++route->rate_skips;
+                return true;
+            }
+            route->next_candidate = now + kInferencePeriod;
+
+            std::unique_lock<std::mutex> slot_lock(route->slot_mutex, std::try_to_lock);
+            if (!slot_lock.owns_lock() || route->slot_writing || route->slot_copying) {
+                ++route->busy_drops;
+                return true;
+            }
+            if (route->slot_ready) {
+                ++route->latest_replacements;
+            }
+            route->slot_ready = false;
+            route->slot_writing = true;
+            slot_lock.unlock();
+
+            const bool processed = route->ivps.Process(frame);
+            bool dump_ok = true;
+            if (processed && route->camera_id == 0 && !route->raw_dump_written &&
+                !options->dump_ivps.empty()) {
+                dump_ok = route->ivps.DumpRawBgr(options->dump_ivps);
+                route->raw_dump_written = dump_ok;
+            }
+
+            slot_lock.lock();
+            route->slot_writing = false;
+            if (processed && dump_ok) {
+                route->slot_metadata.decoded_frame_index = route->vdec.statistics().decoded_frames;
+                route->slot_metadata.source_width = static_cast<int>(frame.stVFrame.u32Width);
+                route->slot_metadata.source_height = static_cast<int>(frame.stVFrame.u32Height);
+                route->slot_ready = true;
+            }
+            slot_lock.unlock();
+
+            if (!processed || !dump_ok) {
+                return false;
+            }
+            if (options->mode == RunMode::kInfer) {
+                scheduler->Notify();
+            }
+            return true;
+        };
+
+        while (!stop_requested->load(std::memory_order_relaxed)) {
+            AccessUnit access_unit;
+            const auto read_timeout_us =
+                static_cast<std::int64_t>(options->read_timeout_ms) * 1000;
+            const ReadResult read_result = route->demuxer.Read(&access_unit, read_timeout_us);
+            if (read_result == ReadResult::kInterrupted) {
+                if (stop_requested->load(std::memory_order_relaxed)) {
+                    break;
+                }
+                LogError("[FFMPEG] RTSP read interrupted by timeout");
+                route_failed = true;
+                break;
+            }
+            if (read_result == ReadResult::kEof) {
+                LogError("[FFMPEG] RTSP stream ended; reconnect is intentionally disabled");
+                route_failed = true;
+                break;
+            }
+            if (read_result == ReadResult::kError) {
+                route_failed = true;
+                break;
+            }
+
+            const VdecSendResult send_result = route->vdec.Send(access_unit, frame_handler);
+            if (send_result == VdecSendResult::kNeedsIdrResync) {
+                route->demuxer.RequestIdrResync();
+                route->PublishSnapshot(CameraRunState::kRunning);
+                continue;
+            }
+            if (send_result == VdecSendResult::kFatal) {
+                if (!stop_requested->load(std::memory_order_relaxed)) {
+                    route_failed = true;
+                }
+                break;
+            }
+            if (Clock::now() >= next_status_refresh) {
+                if (!route->vdec.RefreshStatus() ||
+                    route->vdec.statistics().hardware_decode_errors != 0) {
+                    if (route->vdec.statistics().hardware_decode_errors != 0) {
+                        LogError("[VDEC] hardware decode errors=%llu",
+                                 static_cast<unsigned long long>(
+                                     route->vdec.statistics().hardware_decode_errors));
+                    }
+                    route_failed = true;
+                    break;
+                }
+                next_status_refresh = Clock::now() + std::chrono::seconds(1);
+            }
+            route->PublishSnapshot(CameraRunState::kRunning);
+        }
+
+        if (route_failed) {
+            RequestGlobalFailure(stop_requested, failed, scheduler, lifecycle_condition);
+        } else if (!thread_context.Bind() || !route->vdec.Finish(frame_handler)) {
+            route_failed = true;
+            RequestGlobalFailure(stop_requested, failed, scheduler, lifecycle_condition);
+        }
+    } catch (const std::exception& exception) {
+        LogError("[SYSTEM] camera worker exception: %s", exception.what());
+        route_failed = true;
+    } catch (...) {
+        LogError("[SYSTEM] camera worker threw an unknown exception");
+        route_failed = true;
+    }
+
+    if (!startup_reported) {
+        startup_gate->Report(false);
+    }
+    if (!thread_context.Close()) {
+        route_failed = true;
+    }
+    route->PublishSnapshot(route_failed ? CameraRunState::kFailed : CameraRunState::kStopped);
+    if (route_failed) {
+        RequestGlobalFailure(stop_requested, failed, scheduler, lifecycle_condition);
+    }
+    lifecycle_condition->notify_all();
+}
+
+void RunInferenceWorker(const std::vector<std::unique_ptr<CameraRoute>>* routes,
+                        const Options* options, int runtime_device_id,
+                        StartupGate* startup_gate, InferenceScheduler* scheduler,
+                        InferenceSharedState* shared_state,
+                        std::atomic<bool>* stop_requested, std::atomic<bool>* failed,
+                        std::condition_variable* lifecycle_condition) {
+    AxclThreadContext thread_context;
+    Yolo26Inference yolo;
+    bool startup_reported = false;
+    bool worker_failed = false;
+
+    try {
+        if (!thread_context.Open(runtime_device_id) || !yolo.Open(options->model, kInputBytes)) {
+            shared_state->Publish(yolo.statistics());
+            startup_gate->Report(false);
+            startup_reported = true;
+            return;
+        }
+        shared_state->Publish(yolo.statistics());
+        startup_gate->Report(true);
+        startup_reported = true;
+        if (!startup_gate->WaitForRelease()) {
+            yolo.Close();
+            (void)thread_context.Close();
+            return;
+        }
+
+        std::size_t next_camera = 0;
+        while (!stop_requested->load(std::memory_order_relaxed)) {
+            const auto observed_generation =
+                scheduler->generation.load(std::memory_order_acquire);
+            bool handled = false;
+
+            for (std::size_t offset = 0; offset < kCameraCount; ++offset) {
+                const std::size_t camera_id = (next_camera + offset) % kCameraCount;
+                CameraRoute& route = *(*routes)[camera_id];
+                FrameSlotMetadata metadata{};
+                {
+                    std::lock_guard<std::mutex> slot_lock(route.slot_mutex);
+                    if (!route.slot_ready || route.slot_writing || route.slot_copying) {
+                        continue;
+                    }
+                    route.slot_copying = true;
+                    route.slot_ready = false;
+                    metadata = route.slot_metadata;
+                }
+
+                ScopedCameraLogContext inference_log_context(static_cast<int>(camera_id));
+                const bool copied = yolo.CopyInput(route.ivps.physical_address(), route.ivps.bytes());
+                {
+                    std::lock_guard<std::mutex> slot_lock(route.slot_mutex);
+                    route.slot_copying = false;
+                }
+                if (!copied) {
+                    route.inference_errors.fetch_add(1, std::memory_order_relaxed);
+                    shared_state->Publish(yolo.statistics());
+                    worker_failed = true;
+                    break;
+                }
+
+                std::size_t object_count = 0;
+                if (!yolo.Run(camera_id, metadata.decoded_frame_index,
+                              metadata.source_width, metadata.source_height, &object_count)) {
+                    route.inference_errors.fetch_add(1, std::memory_order_relaxed);
+                    shared_state->Publish(yolo.statistics());
+                    worker_failed = true;
+                    break;
+                }
+                route.inference_frames.fetch_add(1, std::memory_order_relaxed);
+                route.detections.fetch_add(static_cast<std::uint64_t>(object_count),
+                                           std::memory_order_relaxed);
+                shared_state->Publish(yolo.statistics());
+                next_camera = (camera_id + 1) % kCameraCount;
+                handled = true;
+                break;
+            }
+
+            if (worker_failed) {
+                RequestGlobalFailure(stop_requested, failed, scheduler, lifecycle_condition);
+                break;
+            }
+            if (!handled) {
+                std::unique_lock<std::mutex> wait_lock(scheduler->mutex);
+                scheduler->condition.wait_for(
+                    wait_lock, std::chrono::milliseconds(20), [&] {
+                        return stop_requested->load(std::memory_order_relaxed) ||
+                               scheduler->generation.load(std::memory_order_acquire) !=
+                                   observed_generation;
+                    });
+            }
+        }
+    } catch (const std::exception& exception) {
+        LogError("[SYSTEM] inference worker exception: %s", exception.what());
+        worker_failed = true;
+    } catch (...) {
+        LogError("[SYSTEM] inference worker threw an unknown exception");
+        worker_failed = true;
+    }
+
+    if (!startup_reported) {
+        startup_gate->Report(false);
+    }
+    shared_state->Publish(yolo.statistics());
+    yolo.Close();
+    if (!thread_context.Close()) {
+        worker_failed = true;
+    }
+    if (worker_failed) {
+        RequestGlobalFailure(stop_requested, failed, scheduler, lifecycle_condition);
+    }
+    lifecycle_condition->notify_all();
+}
+
+void PrintMultiStatistics(const Options& options, Clock::time_point started,
+                          const std::vector<std::unique_ptr<CameraRoute>>& routes,
+                          const InferenceSharedState& inference_state, const char* tag,
+                          StatisticsTracker* tracker) {
+    const auto now = Clock::now();
+    const double interval_seconds =
+        std::max(ElapsedSeconds(tracker->previous_time, now), 0.001);
+    const double elapsed_seconds = std::max(ElapsedSeconds(started, now), 0.001);
+    const InferenceStatistics inference = inference_state.Read();
+    const std::uint64_t interval_inference_frames =
+        CounterDelta(inference.frames, tracker->total_inference_frames);
+    const double interval_inference_ms =
+        CounterDelta(inference.inference_total_ms, tracker->inference_total_ms);
+    const double inference_average_ms = interval_inference_frames == 0
+                                            ? 0.0
+                                            : interval_inference_ms /
+                                                  static_cast<double>(interval_inference_frames);
+
+    std::string console_cameras;
+    double total_decoded_fps = 0.0;
+    double total_inference_fps = 0.0;
+    std::uint64_t total_errors = inference.errors;
+
+    for (std::size_t camera_id = 0; camera_id < routes.size(); ++camera_id) {
+        const CameraRoute& route = *routes[camera_id];
+        const RouteSnapshot snapshot = route.ReadSnapshot();
+        const std::uint64_t inferred = route.inference_frames.load(std::memory_order_relaxed);
+        const std::uint64_t infer_errors = route.inference_errors.load(std::memory_order_relaxed);
+        const std::uint64_t detections = route.detections.load(std::memory_order_relaxed);
+
+        const double decoded_fps =
+            static_cast<double>(CounterDelta(snapshot.vdec.decoded_frames,
+                                             tracker->decoded_frames[camera_id])) /
+            interval_seconds;
+        const double infer_fps =
+            static_cast<double>(CounterDelta(inferred,
+                                             tracker->inference_frames[camera_id])) /
+            interval_seconds;
+        const std::uint64_t interval_rate_skips =
+            CounterDelta(snapshot.rate_skips, tracker->rate_skips[camera_id]);
+        const std::uint64_t interval_busy_drops =
+            CounterDelta(snapshot.busy_drops, tracker->busy_drops[camera_id]);
+
+        char camera_text[256]{};
+        std::snprintf(camera_text, sizeof(camera_text),
+                      "%scam%zu[%s] dec=%.1f infer=%.1f rate_skips=%llu busy_drops=%llu",
+                      camera_id == 0 ? "" : " | ", camera_id,
+                      CameraRunStateName(snapshot.state), decoded_fps, infer_fps,
+                      static_cast<unsigned long long>(interval_rate_skips),
+                      static_cast<unsigned long long>(interval_busy_drops));
+        console_cameras += camera_text;
+        total_decoded_fps += decoded_fps;
+        total_inference_fps += infer_fps;
+        total_errors += snapshot.ffmpeg_errors + snapshot.vdec.errors +
+                        snapshot.vdec.hardware_decode_errors + snapshot.ivps.errors;
+
+        const double send_average_ms = snapshot.vdec.send_calls == 0
+                                           ? 0.0
+                                           : snapshot.vdec.send_total_ms /
+                                                 static_cast<double>(snapshot.vdec.send_calls);
+        const double ivps_average_ms = snapshot.ivps.frames == 0
+                                           ? 0.0
+                                           : snapshot.ivps.total_ms /
+                                                 static_cast<double>(snapshot.ivps.frames);
+        LogInfo("[%s_DETAIL] camera=%zu state=%s input_packets=%llu attempted_au=%llu "
+                "sent_au=%llu decoded_frames=%llu frame=%ux%u format=%d pts_us=%llu "
+                "vdec_errors=%llu vdec_hw_errors=%llu send_calls=%llu send_failures=%llu "
+                "send_task_timeouts=%llu recovered_task_timeouts=%llu "
+                "unrecovered_task_timeouts=%llu consecutive_task_timeouts=%llu "
+                "max_consecutive_task_timeouts=%llu slow_sends=%llu full_retries=%llu "
+                "send_avg_ms=%.3f send_max_ms=%.3f pending_au=%u pending_frames=%u "
+                "ivps_frames=%llu ivps_errors=%llu ivps_avg_ms=%.3f infer_frames=%llu "
+                "infer_errors=%llu detections=%llu rate_skips=%llu busy_drops=%llu "
+                "latest_replacements=%llu ffmpeg_errors=%llu skipped_before_idr=%llu",
+                tag, camera_id, CameraRunStateName(snapshot.state),
+                static_cast<unsigned long long>(snapshot.input_packets),
+                static_cast<unsigned long long>(snapshot.vdec.attempted_access_units),
+                static_cast<unsigned long long>(snapshot.vdec.sent_access_units),
+                static_cast<unsigned long long>(snapshot.vdec.decoded_frames),
+                snapshot.vdec.last_width, snapshot.vdec.last_height,
+                static_cast<int>(snapshot.vdec.last_format),
+                static_cast<unsigned long long>(snapshot.vdec.last_pts_us),
+                static_cast<unsigned long long>(snapshot.vdec.errors),
+                static_cast<unsigned long long>(snapshot.vdec.hardware_decode_errors),
+                static_cast<unsigned long long>(snapshot.vdec.send_calls),
+                static_cast<unsigned long long>(snapshot.vdec.send_failures),
+                static_cast<unsigned long long>(snapshot.vdec.send_runtime_timeouts),
+                static_cast<unsigned long long>(snapshot.vdec.recovered_task_timeouts),
+                static_cast<unsigned long long>(snapshot.vdec.unrecovered_task_timeouts),
+                static_cast<unsigned long long>(snapshot.vdec.consecutive_task_timeouts),
+                static_cast<unsigned long long>(snapshot.vdec.max_consecutive_task_timeouts),
+                static_cast<unsigned long long>(snapshot.vdec.slow_send_calls),
+                static_cast<unsigned long long>(snapshot.vdec.send_full_retries),
+                send_average_ms, snapshot.vdec.send_max_ms,
+                snapshot.vdec.left_stream_frames, snapshot.vdec.left_output_frames,
+                static_cast<unsigned long long>(snapshot.ivps.frames),
+                static_cast<unsigned long long>(snapshot.ivps.errors), ivps_average_ms,
+                static_cast<unsigned long long>(inferred),
+                static_cast<unsigned long long>(infer_errors),
+                static_cast<unsigned long long>(detections),
+                static_cast<unsigned long long>(snapshot.rate_skips),
+                static_cast<unsigned long long>(snapshot.busy_drops),
+                static_cast<unsigned long long>(snapshot.latest_replacements),
+                static_cast<unsigned long long>(snapshot.ffmpeg_errors),
+                static_cast<unsigned long long>(snapshot.skipped_before_idr));
+
+        tracker->decoded_frames[camera_id] = snapshot.vdec.decoded_frames;
+        tracker->inference_frames[camera_id] = inferred;
+        tracker->rate_skips[camera_id] = snapshot.rate_skips;
+        tracker->busy_drops[camera_id] = snapshot.busy_drops;
+    }
+
+    const double candidate_limit =
+        options.mode == RunMode::kVdecSmoke ? 0.0 : kInferenceLimitFps;
+    LogStatisticsFlush("[%s] mode=%s elapsed=%.1fs %s | total dec=%.1f infer=%.1f "
+                       "candidate_limit=%.1f/camera infer_avg_ms=%.3f errors=%llu",
+                       tag, ModeName(options.mode), elapsed_seconds, console_cameras.c_str(),
+                       total_decoded_fps, total_inference_fps, candidate_limit,
+                       inference_average_ms, static_cast<unsigned long long>(total_errors));
+
+    tracker->previous_time = now;
+    tracker->total_inference_frames = inference.frames;
+    tracker->inference_total_ms = inference.inference_total_ms;
 }
 
 enum class ParseOptionsResult {
@@ -2114,7 +2908,7 @@ ParseOptionsResult ParseOptions(int argc, char* argv[], Options* options) {
     command.add<int>("device", 'd', "AXCL device-list index", false, 0);
     command.add<int>("duration", 't', "run duration in seconds; 0 means until interrupted", false, 0);
     command.add<int>("read-timeout", 'o', "RTSP open/read timeout in milliseconds", false, 5000);
-    command.add<int>("stats-interval", 'i', "statistics interval in seconds", false, 5);
+    command.add<int>("stats-interval", 'i', "statistics interval in seconds", false, 1);
     const bool parsed = command.parse(argc, argv);
     if (command.exist("help")) {
         std::fputs(command.usage().c_str(), stdout);
@@ -2173,8 +2967,10 @@ ParseOptionsResult ParseOptions(int argc, char* argv[], Options* options) {
 }
 
 int Run(const Options& options) {
-    InterruptState interrupt{};
-    g_interrupt_state = &interrupt;
+    std::atomic<bool> stop_requested{false};
+    std::atomic<bool> failed{false};
+    g_stop_requested = &stop_requested;
+
     bool control_handler_registered = true;
 #ifdef _WIN32
     control_handler_registered = SetConsoleCtrlHandler(ConsoleControlHandler, TRUE) != 0;
@@ -2204,7 +3000,7 @@ int Run(const Options& options) {
             std::signal(SIGINT, SIG_DFL);
             std::signal(SIGTERM, SIG_DFL);
 #endif
-            g_interrupt_state = nullptr;
+            g_stop_requested = nullptr;
             return successful;
         }
 
@@ -2240,196 +3036,233 @@ int Run(const Options& options) {
         }
     } network_guard;
 
-    FfmpegRtspDemuxer demuxer(&interrupt);
-    if (!demuxer.Open(options.source, options.read_timeout_ms)) {
-        g_interrupt_state = nullptr;
-        return -1;
-    }
-
     AxclEnvironment environment;
     if (!environment.Initialize(options) || !environment.EnsureCurrentContext()) {
-        g_interrupt_state = nullptr;
         return -1;
     }
 
-    NativeVdec vdec(&interrupt.stop);
-    if (!vdec.Open(kSourceWidth, kSourceHeight)) {
-        g_interrupt_state = nullptr;
-        return -1;
+    std::vector<std::unique_ptr<CameraRoute>> routes;
+    routes.reserve(kCameraCount);
+    for (std::size_t camera_id = 0; camera_id < kCameraCount; ++camera_id) {
+        routes.emplace_back(std::make_unique<CameraRoute>(camera_id, &stop_requested));
+        CameraRoute& route = *routes.back();
+        ScopedCameraLogContext log_context(static_cast<int>(camera_id));
+        if (!environment.EnsureCurrentContext() ||
+            !route.vdec.Open(kSourceWidth, kSourceHeight) ||
+            (options.mode != RunMode::kVdecSmoke && !route.ivps.Open())) {
+            LogError("[SYSTEM] camera startup failed");
+            return -1;
+        }
+        route.PublishSnapshot(CameraRunState::kStarting);
     }
 
-    NativeIvpsPreprocessor ivps;
-    if (options.mode != RunMode::kVdecSmoke && !ivps.Open()) {
-        g_interrupt_state = nullptr;
-        return -1;
-    }
-
-    Yolo26Inference yolo;
-    if (options.mode == RunMode::kInfer &&
-        !yolo.Open(options.model, ivps.physical_address(), ivps.bytes())) {
-        g_interrupt_state = nullptr;
-        return -1;
-    }
-
+    const std::string duration_text = options.duration_seconds == 0
+                                          ? "until Ctrl+C"
+                                          : std::to_string(options.duration_seconds) + "s";
     LogInfo("[CONFIG] mode=%s", ModeName(options.mode));
-    LogInfo("[CONFIG] RTSP source=%s", RedactRtspUrl(options.source).c_str());
+    LogInfo("[CONFIG] RTSP source=%s (replicated across %zu independent connections)",
+            RedactRtspUrl(options.source).c_str(), kCameraCount);
     LogInfo("[CONFIG] model=%s",
             options.mode == RunMode::kInfer ? options.model.c_str() : "<not loaded>");
-    LogInfo("[CONFIG] duration=%s",
-            options.duration_seconds == 0 ? "until Ctrl+C" :
-                                            std::to_string(options.duration_seconds).c_str());
-    LogInfo("[CONFIG] host pixel path=disabled (no decode/resize/CSC)");
-    LogInfo("[CONFIG] pipeline=single stream/thread, no reconnect or load-shedding drops; "
-            "pre-IDR/corrupt packets may be skipped");
+    LogInfo("[CONFIG] duration=%s", duration_text.c_str());
+    if (options.mode == RunMode::kInfer) {
+        LogInfo("[CONFIG] pipeline=%zu RTSP/VDEC workers, %zu VDEC groups, "
+                "one BGR latest-frame slot per camera, one inference worker",
+                kCameraCount, kCameraCount);
+        LogInfo("[CONFIG] host decode/resize/CSC=disabled; selected BGR input uses device D2D copy");
+    } else if (options.mode == RunMode::kIvpsSmoke) {
+        LogInfo("[CONFIG] pipeline=%zu RTSP/VDEC/IVPS workers, inference disabled",
+                kCameraCount);
+    } else {
+        LogInfo("[CONFIG] pipeline=%zu RTSP/VDEC workers, IVPS/inference disabled",
+                kCameraCount);
+    }
+    if (options.mode != RunMode::kVdecSmoke) {
+        LogInfo("[CONFIG] candidate_limit=%.1f FPS/camera period=%lldms phase_step=%lldms "
+                "no catch-up, no reconnect",
+                kInferenceLimitFps, static_cast<long long>(kInferencePeriod.count()),
+                static_cast<long long>(kCameraPhaseStep.count()));
+    }
+    if (!options.dump_ivps.empty()) {
+        LogInfo("[CONFIG] --dump-ivps writes camera 0 only");
+    }
 
-    bool raw_dump_written = false;
-    bool failed = false;
-    const auto started = Clock::now();
-    auto next_statistics = started + std::chrono::seconds(options.statistics_interval_seconds);
+    StartupGate startup_gate;
+    InferenceScheduler scheduler;
+    InferenceSharedState inference_state;
+    std::mutex lifecycle_mutex;
+    std::condition_variable lifecycle_condition;
+    Clock::time_point processing_started = Clock::now();
+    std::vector<std::thread> route_threads;
+    route_threads.reserve(kCameraCount);
+    std::thread inference_thread;
+    bool thread_creation_failed = false;
 
-    const NativeVdec::FrameHandler frame_handler = [&](const AX_VIDEO_FRAME_INFO_T& frame) {
-        if (!environment.EnsureCurrentContext()) {
-            return false;
+    try {
+        for (auto& route : routes) {
+            route_threads.emplace_back(RunCameraRoute, route.get(), &options,
+                                       environment.runtime_device_id(), &processing_started,
+                                       &startup_gate, &scheduler, &stop_requested, &failed,
+                                       &lifecycle_condition);
         }
-        if (frame.stVFrame.u32Width != kSourceWidth || frame.stVFrame.u32Height != kSourceHeight ||
-            frame.stVFrame.enImgFormat != AX_FORMAT_YUV420_SEMIPLANAR) {
-            LogError("[VDEC] unexpected frame: %ux%u format=%d pts=%llu",
-                     frame.stVFrame.u32Width, frame.stVFrame.u32Height,
-                     static_cast<int>(frame.stVFrame.enImgFormat),
-                     static_cast<unsigned long long>(frame.stVFrame.u64PTS));
-            return false;
+        if (options.mode == RunMode::kInfer) {
+            inference_thread = std::thread(RunInferenceWorker, &routes, &options,
+                                           environment.runtime_device_id(), &startup_gate,
+                                           &scheduler, &inference_state, &stop_requested,
+                                           &failed, &lifecycle_condition);
         }
+    } catch (const std::system_error& exception) {
+        LogError("[SYSTEM] worker thread creation failed: %s", exception.what());
+        thread_creation_failed = true;
+        failed.store(true, std::memory_order_relaxed);
+        stop_requested.store(true, std::memory_order_relaxed);
+    }
 
-        if (options.mode == RunMode::kVdecSmoke) {
-            return true;
+    bool startup_successful = false;
+    if (!thread_creation_failed) {
+        const std::size_t expected_workers =
+            kCameraCount + (options.mode == RunMode::kInfer ? 1U : 0U);
+        startup_successful = startup_gate.WaitForAll(expected_workers);
+        if (!startup_successful) {
+            LogError("[SYSTEM] at least one worker failed during startup");
+            failed.store(true, std::memory_order_relaxed);
+            stop_requested.store(true, std::memory_order_relaxed);
         }
-        if (!ivps.Process(frame)) {
-            return false;
-        }
-        if (!raw_dump_written && !options.dump_ivps.empty()) {
-            if (!ivps.DumpRawBgr(options.dump_ivps)) {
-                return false;
+    }
+
+    processing_started = Clock::now();
+    startup_gate.Release(startup_successful);
+    scheduler.Notify();
+    lifecycle_condition.notify_all();
+
+    StatisticsTracker statistics_tracker{};
+    statistics_tracker.previous_time = processing_started;
+    if (startup_successful) {
+        const auto statistics_period =
+            std::chrono::seconds(options.statistics_interval_seconds);
+        auto next_statistics = processing_started + statistics_period;
+        const auto duration_deadline = options.duration_seconds > 0
+                                           ? processing_started +
+                                                 std::chrono::seconds(options.duration_seconds)
+                                           : Clock::time_point::max();
+
+        while (!stop_requested.load(std::memory_order_relaxed)) {
+            const auto wake_time = std::min(next_statistics, duration_deadline);
+            std::unique_lock<std::mutex> lifecycle_lock(lifecycle_mutex);
+            lifecycle_condition.wait_until(lifecycle_lock, wake_time, [&] {
+                return stop_requested.load(std::memory_order_relaxed);
+            });
+            lifecycle_lock.unlock();
+
+            const auto now = Clock::now();
+            if (now >= duration_deadline) {
+                stop_requested.store(true, std::memory_order_relaxed);
+                break;
             }
-            raw_dump_written = true;
+            if (now >= next_statistics &&
+                !stop_requested.load(std::memory_order_relaxed)) {
+                PrintMultiStatistics(options, processing_started, routes, inference_state,
+                                     "STATS", &statistics_tracker);
+                next_statistics = now + statistics_period;
+            }
+        }
+    }
+
+    stop_requested.store(true, std::memory_order_relaxed);
+    scheduler.Notify();
+    lifecycle_condition.notify_all();
+    if (inference_thread.joinable()) {
+        inference_thread.join();
+    }
+    for (auto& route_thread : route_threads) {
+        if (route_thread.joinable()) {
+            route_thread.join();
+        }
+    }
+
+    if (!environment.EnsureCurrentContext()) {
+        failed.store(true, std::memory_order_relaxed);
+    } else {
+        for (auto& route : routes) {
+            ScopedCameraLogContext log_context(static_cast<int>(route->camera_id));
+            const CameraRunState final_state = route->ReadSnapshot().state;
+            if (!route->vdec.RefreshStatus()) {
+                failed.store(true, std::memory_order_relaxed);
+            }
+            route->PublishSnapshot(final_state);
+        }
+    }
+
+    PrintMultiStatistics(options, processing_started, routes, inference_state,
+                         "FINAL", &statistics_tracker);
+
+    for (std::size_t camera_id = 0; camera_id < routes.size(); ++camera_id) {
+        CameraRoute& route = *routes[camera_id];
+        const RouteSnapshot snapshot = route.ReadSnapshot();
+        ScopedCameraLogContext log_context(static_cast<int>(camera_id));
+        if (snapshot.vdec.decoded_frames == 0 || snapshot.vdec.errors != 0 ||
+            snapshot.vdec.hardware_decode_errors != 0 || snapshot.ffmpeg_errors != 0) {
+            LogError("[FINAL] decode validation failed: decoded_frames=%llu vdec_errors=%llu "
+                     "vdec_hw_errors=%llu ffmpeg_errors=%llu",
+                     static_cast<unsigned long long>(snapshot.vdec.decoded_frames),
+                     static_cast<unsigned long long>(snapshot.vdec.errors),
+                     static_cast<unsigned long long>(snapshot.vdec.hardware_decode_errors),
+                     static_cast<unsigned long long>(snapshot.ffmpeg_errors));
+            failed.store(true, std::memory_order_relaxed);
+        }
+        if (options.mode != RunMode::kVdecSmoke &&
+            (snapshot.ivps.frames == 0 || snapshot.ivps.errors != 0)) {
+            LogError("[FINAL] IVPS validation failed: frames=%llu errors=%llu",
+                     static_cast<unsigned long long>(snapshot.ivps.frames),
+                     static_cast<unsigned long long>(snapshot.ivps.errors));
+            failed.store(true, std::memory_order_relaxed);
         }
         if (options.mode == RunMode::kInfer &&
-            !yolo.Run(vdec.statistics().decoded_frames,
-                      frame.stVFrame.u32Width, frame.stVFrame.u32Height)) {
-            return false;
-        }
-        return true;
-    };
-
-    while (!interrupt.stop.load(std::memory_order_relaxed)) {
-        const double elapsed = ElapsedSeconds(started);
-        if (options.duration_seconds > 0 && elapsed >= options.duration_seconds) {
-            interrupt.stop.store(true, std::memory_order_relaxed);
-            break;
-        }
-
-        std::int64_t read_timeout_us = static_cast<std::int64_t>(options.read_timeout_ms) * 1000;
-        if (options.duration_seconds > 0) {
-            const auto remaining_us = static_cast<std::int64_t>(
-                (static_cast<double>(options.duration_seconds) - elapsed) * 1000000.0);
-            read_timeout_us = std::max<std::int64_t>(1, std::min(read_timeout_us, remaining_us));
-        }
-
-        AccessUnit access_unit;
-        const ReadResult read_result = demuxer.Read(&access_unit, read_timeout_us);
-        if (read_result == ReadResult::kInterrupted) {
-            if (options.duration_seconds > 0 && ElapsedSeconds(started) >= options.duration_seconds) {
-                interrupt.stop.store(true, std::memory_order_relaxed);
-                break;
-            }
-            if (interrupt.stop.load(std::memory_order_relaxed)) {
-                break;
-            }
-            LogError("[FFMPEG] RTSP read interrupted by timeout");
-            failed = true;
-            break;
-        }
-        if (read_result == ReadResult::kEof) {
-            LogError("[FFMPEG] RTSP stream ended; reconnect is intentionally disabled");
-            failed = true;
-            break;
-        }
-        if (read_result == ReadResult::kError) {
-            failed = true;
-            break;
-        }
-
-        if (!environment.EnsureCurrentContext()) {
-            failed = true;
-            break;
-        }
-        if (!vdec.Send(access_unit, frame_handler)) {
-            if (!interrupt.stop.load(std::memory_order_relaxed)) {
-                failed = true;
-            }
-            break;
-        }
-
-        if (Clock::now() >= next_statistics) {
-            PrintStatistics(options, started, demuxer, vdec,
-                            options.mode == RunMode::kVdecSmoke ? nullptr : &ivps,
-                            options.mode == RunMode::kInfer ? &yolo : nullptr, "STATS");
-            next_statistics = Clock::now() + std::chrono::seconds(options.statistics_interval_seconds);
+            (route.inference_frames.load(std::memory_order_relaxed) == 0 ||
+             route.inference_errors.load(std::memory_order_relaxed) != 0)) {
+            LogError("[FINAL] inference validation failed: frames=%llu errors=%llu",
+                     static_cast<unsigned long long>(
+                         route.inference_frames.load(std::memory_order_relaxed)),
+                     static_cast<unsigned long long>(
+                         route.inference_errors.load(std::memory_order_relaxed)));
+            failed.store(true, std::memory_order_relaxed);
         }
     }
 
-    if (!environment.EnsureCurrentContext() || !vdec.Finish(frame_handler)) {
-        failed = true;
-    }
-    PrintStatistics(options, started, demuxer, vdec,
-                    options.mode == RunMode::kVdecSmoke ? nullptr : &ivps,
-                    options.mode == RunMode::kInfer ? &yolo : nullptr, "FINAL");
-
-    const auto& decode_statistics = vdec.statistics();
-    if (decode_statistics.decoded_frames == 0 || decode_statistics.errors != 0 ||
-        decode_statistics.hardware_decode_errors != 0 || demuxer.ffmpeg_errors() != 0) {
-        LogError("[FINAL] decode validation failed: decoded_frames=%llu vdec_errors=%llu "
-                 "vdec_hw_errors=%llu ffmpeg_errors=%llu",
-                 static_cast<unsigned long long>(decode_statistics.decoded_frames),
-                 static_cast<unsigned long long>(decode_statistics.errors),
-                 static_cast<unsigned long long>(decode_statistics.hardware_decode_errors),
-                 static_cast<unsigned long long>(demuxer.ffmpeg_errors()));
-        failed = true;
-    }
-    if (options.mode != RunMode::kVdecSmoke &&
-        (ivps.statistics().frames == 0 || ivps.statistics().errors != 0)) {
-        LogError("[FINAL] IVPS validation failed: frames=%llu errors=%llu",
-                 static_cast<unsigned long long>(ivps.statistics().frames),
-                 static_cast<unsigned long long>(ivps.statistics().errors));
-        failed = true;
-    }
+    const InferenceStatistics final_inference = inference_state.Read();
     if (options.mode == RunMode::kInfer &&
-        (yolo.statistics().frames == 0 || yolo.statistics().errors != 0)) {
-        LogError("[FINAL] inference validation failed: frames=%llu errors=%llu",
-                 static_cast<unsigned long long>(yolo.statistics().frames),
-                 static_cast<unsigned long long>(yolo.statistics().errors));
-        failed = true;
+        (final_inference.frames == 0 || final_inference.errors != 0)) {
+        LogError("[FINAL] shared inference validation failed: frames=%llu errors=%llu",
+                 static_cast<unsigned long long>(final_inference.frames),
+                 static_cast<unsigned long long>(final_inference.errors));
+        failed.store(true, std::memory_order_relaxed);
     }
 
-    yolo.Close();
-    if (!ivps.Close()) {
-        failed = true;
+    if (!environment.EnsureCurrentContext()) {
+        failed.store(true, std::memory_order_relaxed);
     }
-    if (!vdec.Close()) {
-        failed = true;
+    for (auto& route : routes) {
+        ScopedCameraLogContext log_context(static_cast<int>(route->camera_id));
+        if (!route->ivps.Close()) {
+            failed.store(true, std::memory_order_relaxed);
+        }
+        if (!route->vdec.Close()) {
+            failed.store(true, std::memory_order_relaxed);
+        }
+        route->demuxer.Close();
     }
     if (!environment.Shutdown()) {
-        failed = true;
+        failed.store(true, std::memory_order_relaxed);
     }
-    demuxer.Close();
     if (!network_guard.Release()) {
-        failed = true;
+        failed.store(true, std::memory_order_relaxed);
     }
     if (!control_handler_guard.Release()) {
-        failed = true;
+        failed.store(true, std::memory_order_relaxed);
     }
     FlushApplicationLog();
 
-    return failed ? -1 : 0;
+    return failed.load(std::memory_order_relaxed) ? -1 : 0;
 }
 
 }  // namespace

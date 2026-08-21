@@ -135,7 +135,8 @@ build-win\examples\axcl\axcl_yolo26.exe -m D:\models\yolo26n.axmodel -s "rtsp://
 
 - `vdec-smoke`：FFmpeg `libavformat` RTSP 解封装 → AXCL Native VDEC；
 - `ivps-smoke`：VDEC NV12 → AXCL Native IVPS 640×640 BGR，黑色居中 letterbox；
-- `infer`：IVPS CMM（连续媒体内存）直接绑定 `ax_runner_axcl` 输入，再执行 YOLO26 和 CPU 后处理。
+- `infer`：四路 IVPS 分别写入自己的 CMM（连续媒体内存）最新帧槽，单推理线程将选中帧 D2D
+  （设备到设备）复制到 `ax_runner_axcl` 固定输入，再执行 YOLO26 和 CPU 后处理。
 
 该目标默认不参与构建，避免没有 FFmpeg 开发包时影响已有示例。以下命令均在 Visual Studio 2022 Developer Command Prompt（开发者命令提示符）中执行。
 
@@ -161,22 +162,27 @@ cmake --build build-native --target ax_yolo26_rtsp_native -j 4
 build-native\examples\axcl\ax_yolo26_rtsp_native.exe
 ```
 
-原生目标与上面的 OpenCV 目标共享默认模型路径和 RTSP 地址。无参数启动时默认进入 `infer` 模式：
+原生目标与上面的 OpenCV 目标共享默认模型路径和 RTSP 地址。无参数启动时默认进入 `infer` 模式，
+并使用同一个地址建立四条独立 RTSP 连接；RTSP 服务端必须允许同一地址同时连接四次：
 
 ```cmd
 build-native\examples\axcl\ax_yolo26_rtsp_native.exe
 ```
 
-也可以通过 `--model`/`-m` 和 `--source`/`-s` 覆盖默认值。下列命令中的 RTSP URL 只作为覆盖格式示例，请替换为实际地址。程序日志会隐藏密码，但共享默认地址仍以明文存在于 `examples\axcl\yolo26_defaults.hpp` 中。
+也可以通过 `--model`/`-m` 和 `--source`/`-s` 覆盖默认值。`--source` 仍只接收一个地址，程序会将
+它复制给 `camera=0～3`。下列命令中的 RTSP URL 只作为覆盖格式示例，请替换为实际地址。程序日志会
+隐藏密码，但共享默认地址仍以明文存在于 `examples\axcl\yolo26_defaults.hpp` 中。
 
 程序通过命令行正常启动后，会在当前工作目录的 `log` 文件夹中创建独立日志文件，命名格式为
 `ax_yolo26_rtsp_native_日期_时间_毫秒_pid进程号.log`。应用日志统一带本地毫秒时间戳；逐帧
 `[DETECTION]`、周期统计、FFmpeg、AXCL、VDEC、IVPS 和推理日志均写入该文件。AXCL SDK 自身生成的
 `axcl_logs.txt` 继续单独保存，不与应用日志合并。
 
-正常信息和警告不再输出到控制台。应用检测到无法继续运行的错误时，会立即将错误同时写入日志和原始
-控制台，并在第一次错误后显示日志绝对路径。`--help` 和参数错误直接显示在控制台，不创建运行日志。
-日志目录或文件创建失败时，程序会在控制台报错并停止运行。
+逐帧检测、正常信息和警告不输出到控制台；默认每秒将一条 `[STATS]` 四路增量统计同时写入日志和
+原始控制台。统计包含每路 `decoded_fps`、`infer_fps`、`rate_skips`、`busy_drops`，以及合计推理 FPS、
+模型平均耗时和累计错误数。应用检测到无法继续运行的错误时，会立即将错误同时写入日志和原始控制台，
+并在第一次错误后显示日志绝对路径。`--help` 和参数错误直接显示在控制台，不创建运行日志。日志目录或
+文件创建失败时，程序会在控制台报错并停止运行。可用 `--stats-interval` 修改统计间隔，默认值为 `1` 秒。
 
 在 Windows 中直接双击 `.exe`，程序结束后会提示按任意键关闭窗口；从已有 Developer Command Prompt
 或其他共享控制台启动时不会暂停。IDE（集成开发环境）或脚本如果为程序创建独立控制台，也可能触发
@@ -184,10 +190,15 @@ build-native\examples\axcl\ax_yolo26_rtsp_native.exe
 终止进程，此时程序内部无法保持控制台窗口，应从 Developer Command Prompt 启动以查看系统错误。
 Linux 不启用退出暂停。
 
-VDEC 统计额外包含 `attempted_au`、`send_calls`、`send_failures`、`send_task_timeouts`、`slow_sends`、
-`send_avg_ms` 和 `send_max_ms`；其中 `send_calls` 还包含队列满重试和 EOS（码流结束标记）发送。单次
-`AXCL_VDEC_SendStream` 达到 `50 ms` 会记录慢调用；送流失败时会记录错误码分解、PTS、数据大小和一次
-故障现场 `AXCL_VDEC_QueryStatus` 快照。诊断不会重发结果不确定的 AU，也不会改变原有的失败退出策略。
+日志文件中的每路 `[STATS_DETAIL]` 额外包含 `attempted_au`、`send_calls`、`send_failures`、
+`send_task_timeouts`、`recovered_task_timeouts`、`unrecovered_task_timeouts`、
+`consecutive_task_timeouts`、`max_consecutive_task_timeouts`、`slow_sends`、`send_avg_ms`、
+`send_max_ms`、`latest_replacements` 等累计指标；其中
+`send_calls` 还包含队列满重试和 EOS（码流结束标记）发送。单次 `AXCL_VDEC_SendStream` 达到 `50 ms`
+会记录慢调用；送流失败时会记录错误码分解、PTS、数据大小和一次故障现场
+`AXCL_VDEC_QueryStatus` 快照。Runtime Task（运行时任务）超时时不会重发结果不确定的 AU：设备状态确认
+已经接收时继续取帧，未确认接收时丢弃后续非 IDR 帧并从下一个 IDR 恢复；状态异常或连续三次任务超时
+视为不可恢复错误，协调停止全部四路并返回非零退出码。
 
 ### 阶段一：VDEC smoke
 
@@ -198,10 +209,12 @@ build-native\examples\axcl\ax_yolo26_rtsp_native.exe --mode vdec-smoke --duratio
 验收条件：
 
 - 连续运行不少于 60 秒并正常退出；
-- `input_packets`、`sent_au`、`decoded_frames` 持续增加；
-- 输出为 `2560x1440`、NV12，`decoded_fps` 接近视频源帧率；
-- 最终日志中 `vdec_errors=0`、`vdec_hw_errors=0`、`ffmpeg_errors=0`；
-- `send_failures=0`、`send_task_timeouts=0`；
+- 日志出现 `camera=0～3` 四路，四路 `input_packets`、`sent_au`、`decoded_frames` 均持续增加；
+- 四个 VDEC Group 均输出 `2560x1440`、NV12，各路 `decoded_fps` 接近视频源帧率；
+- 每个 Group 使用 8 个输出帧缓冲，四路合计 32 个，避免沿用原单路 32 个后直接放大四倍 CMM；
+- 最终每路日志中 `vdec_errors=0`、`vdec_hw_errors=0`、`ffmpeg_errors=0`；
+- `unrecovered_task_timeouts=0`；`send_task_timeouts=0` 最佳，若非零则必须全部计入
+  `recovered_task_timeouts`，且 `max_consecutive_task_timeouts < 3`；
 - `full_retries` 可以非零，但不能持续增长并导致 FPS 停滞。
 
 ### 阶段二：IVPS smoke
@@ -213,11 +226,12 @@ build-native\examples\axcl\ax_yolo26_rtsp_native.exe --mode ivps-smoke --duratio
 验收条件：
 
 - 阶段一的条件继续成立；
-- `ivps_frames` 持续增加且 `ivps_errors=0`；
+- 每路 `ivps_frames` 以不超过 10 FPS 的速度增加且 `ivps_errors=0`；
 - `native_640x640.bgr` 恰好为 `1228800` 字节；
 - 诊断帧是 640×640 packed BGR，2560×1440 内容应缩放为 640×360，并在上、下各产生 140 像素黑边。
 
-`--dump-ivps` 仅回读第一帧用于诊断，不执行 Host resize 或 CSC（色彩空间转换）；不指定该参数时，IVPS像素不会回到Host。
+`--dump-ivps` 仅回读 `camera=0` 的第一张候选帧用于诊断，不执行 Host resize 或 CSC（色彩空间转换）；
+不指定该参数时，IVPS 像素不会回到 Host。
 
 ### 阶段三：完整推理
 
@@ -229,12 +243,37 @@ build-native\examples\axcl\ax_yolo26_rtsp_native.exe --mode infer --duration 60 
 
 验收条件：
 
-- 启动日志包含 `direct device input bound`、`auto_sync_before=false` 和 `auto_sync_after=true`；
-- `infer_frames` 持续增加，`infer_errors=0`，并逐帧输出一行 `[DETECTION]` 摘要；
-- VDEC、IVPS、FFmpeg错误计数仍为 0；
-- 正式链路没有 Host 视频解码、resize、CSC或NPU输入H2D复制。
+- 启动日志包含 `fixed runner input ready`、`auto_sync_before=false` 和 `auto_sync_after=true`；
+- 每路 `infer_fps` 不超过 10，四路公平调度；如果单推理实例不足 40 FPS，旧候选帧会被最新帧覆盖而不积压；
+- 四路 `infer_frames` 均持续增加、`infer_errors=0`，日志中的每条 `[DETECTION]` 都包含 `camera=0～3`；
+- VDEC、IVPS、FFmpeg 错误计数仍为 0；
+- 正式链路没有 Host 视频解码、resize、CSC 或 NPU 输入 H2D（主机到设备）复制；每个候选帧只执行
+  一次约 1.2 MB 的设备内 D2D 复制。
 
-首版固定为单路、单线程串行、H.264、2560×1440、RTSP over TCP，不重连、不创建队列、不主动做负载丢帧。若读取超时或流结束，程序会记录错误并退出，便于根据首个错误定位问题。
+首版固定为四路、H.264、2560×1440、RTSP over TCP。四条连接各自使用一个解码线程、Runtime Context
+（运行时上下文）、VDEC Group 和 IVPS 最新帧槽；四路共享一个模型和一个推理线程。每路使用单调时钟
+限制为最多 10 FPS，四路相位错开 25 ms，不补做历史帧。程序不自动重连；任意一路读取超时、流结束
+或处理失败时会记录错误并停止全部路线。`--duration 0` 表示持续运行直到 Ctrl+C 或发生错误，与累计
+识别帧数无关。
+
+### 每秒刷新 AX8850 设备状态
+
+`axcl-smi` 本身执行一次后退出。保持推理程序运行，在另一个 PowerShell 窗口进入仓库根目录并执行：
+
+```powershell
+.\examples\axcl\monitor_ax_yolo26_rtsp_native.ps1
+```
+
+脚本每秒清屏并顺序执行一次 PATH 中的 `axcl-smi.exe`，显示 CPU/NPU（神经网络处理器）利用率、内存、
+CMM 和温度等设备级指标；命令返回非零退出码时会显示警告，按 Ctrl+C 停止。如果 `axcl-smi.exe` 不在
+PATH，可将绝对路径作为第一个参数：
+
+```powershell
+.\examples\axcl\monitor_ax_yolo26_rtsp_native.ps1 "D:\AXCL\axcl\out\axcl_win_x64\bin\axcl-smi.exe"
+```
+
+设备级指标与主程序控制台中的四路业务 FPS 分开显示。Linux 主机可直接使用
+`watch -n 1 axcl-smi` 达到相同刷新效果。
 
 ## Linux 编译简版
 
