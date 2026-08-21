@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <deque>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -109,9 +110,13 @@ constexpr AX_S32 kAxWaitMs = 100;
 constexpr double kSlowVdecSendMilliseconds = 50.0;
 constexpr std::uint64_t kMaxConsecutiveVdecTaskTimeouts = 3;
 constexpr std::size_t kCameraCount = 4;
-constexpr double kInferenceLimitFps = 10.0;
-constexpr std::chrono::milliseconds kInferencePeriod{100};
-constexpr std::chrono::milliseconds kCameraPhaseStep{25};
+constexpr double kInferenceLimitFps = 11.0;
+constexpr std::chrono::microseconds kInferencePeriod{1'000'000 / 11};
+constexpr std::chrono::microseconds kCameraPhaseStep{
+    kInferencePeriod.count() / static_cast<long long>(kCameraCount)};
+constexpr double kMinimumInferenceFps = 10.0;
+constexpr std::chrono::seconds kInferenceRateWindow{10};
+constexpr std::chrono::seconds kLowInferenceWarningRepeat{30};
 constexpr AX_S32 kAxclRuntimeTaskTimeout =
     AXCL_DEF_RUNTIME_ERR(AXCL_RUNTIME_TASK, AXCL_ERR_TIMEOUT);
 
@@ -187,6 +192,33 @@ std::string FormatLogMessage(const char* format, va_list arguments) {
     return std::string(buffer.data(), static_cast<std::size_t>(written));
 }
 
+void WriteOriginalConsoleLocked(ApplicationLogLevel level, const std::string& timestamp,
+                                const std::string& message) {
+    if (g_original_standard_error == nullptr) {
+        return;
+    }
+    const char* level_name = ApplicationLogLevelName(level);
+    if (g_application_log_camera_id >= 0) {
+        std::fprintf(g_original_standard_error, "[%s][%s][camera=%d] %s\n",
+                     timestamp.c_str(), level_name, g_application_log_camera_id,
+                     message.c_str());
+    } else {
+        std::fprintf(g_original_standard_error, "[%s][%s] %s\n",
+                     timestamp.c_str(), level_name, message.c_str());
+    }
+    std::fflush(g_original_standard_error);
+}
+
+void ReportApplicationLogPathLocked() {
+    if (g_original_standard_error == nullptr || g_console_log_path_reported ||
+        g_application_log_path.empty()) {
+        return;
+    }
+    std::fprintf(g_original_standard_error, "[LOG] %s\n", g_application_log_path.c_str());
+    std::fflush(g_original_standard_error);
+    g_console_log_path_reported = true;
+}
+
 void WriteApplicationLog(ApplicationLogLevel level, bool flush, bool mirror_to_console,
                          const char* format, va_list arguments) {
     const std::string message = FormatLogMessage(format, arguments);
@@ -206,21 +238,25 @@ void WriteApplicationLog(ApplicationLogLevel level, bool flush, bool mirror_to_c
 
     if ((level == ApplicationLogLevel::kError || mirror_to_console) &&
         g_original_standard_error != nullptr) {
-        if (g_application_log_camera_id >= 0) {
-            std::fprintf(g_original_standard_error, "[%s][%s][camera=%d] %s\n",
-                         timestamp.c_str(), level_name, g_application_log_camera_id,
-                         message.c_str());
-        } else {
-            std::fprintf(g_original_standard_error, "[%s][%s] %s\n",
-                         timestamp.c_str(), level_name, message.c_str());
+        WriteOriginalConsoleLocked(level, timestamp, message);
+        if (level == ApplicationLogLevel::kError) {
+            ReportApplicationLogPathLocked();
         }
-        if (level == ApplicationLogLevel::kError && !g_console_log_path_reported &&
-            !g_application_log_path.empty()) {
-            std::fprintf(g_original_standard_error, "[LOG] %s\n", g_application_log_path.c_str());
-            g_console_log_path_reported = true;
-        }
+    }
+}
+
+void WriteConsoleOnly(const char* format, va_list arguments) {
+    const std::string message = FormatLogMessage(format, arguments);
+    std::lock_guard<std::mutex> lock(g_application_log_mutex);
+    if (g_original_standard_error != nullptr) {
+        std::fprintf(g_original_standard_error, "%s\n", message.c_str());
         std::fflush(g_original_standard_error);
     }
+}
+
+void ReportApplicationLogPath() {
+    std::lock_guard<std::mutex> lock(g_application_log_mutex);
+    ReportApplicationLogPathLocked();
 }
 
 void LogInfo(const char* format, ...) {
@@ -237,17 +273,24 @@ void LogInfoFlush(const char* format, ...) {
     va_end(arguments);
 }
 
-void LogStatisticsFlush(const char* format, ...) {
+void LogConsoleInfo(const char* format, ...) {
     va_list arguments;
     va_start(arguments, format);
     WriteApplicationLog(ApplicationLogLevel::kInfo, true, true, format, arguments);
     va_end(arguments);
 }
 
+void PrintConsoleLine(const char* format, ...) {
+    va_list arguments;
+    va_start(arguments, format);
+    WriteConsoleOnly(format, arguments);
+    va_end(arguments);
+}
+
 void LogWarning(const char* format, ...) {
     va_list arguments;
     va_start(arguments, format);
-    WriteApplicationLog(ApplicationLogLevel::kWarning, true, false, format, arguments);
+    WriteApplicationLog(ApplicationLogLevel::kWarning, true, true, format, arguments);
     va_end(arguments);
 }
 
@@ -516,6 +559,7 @@ bool InitializeApplicationLogging() {
     const fs::path absolute_path = fs::absolute(log_path, absolute_error);
     g_application_log_path = PathForLog(absolute_error ? log_path : absolute_path);
     LogInfoFlush("[SYSTEM] application log initialized: %s", g_application_log_path.c_str());
+    ReportApplicationLogPath();
     return true;
 }
 
@@ -667,6 +711,15 @@ double ElapsedSeconds(Clock::time_point begin, Clock::time_point end = Clock::no
 
 double ElapsedMilliseconds(Clock::time_point begin, Clock::time_point end = Clock::now()) {
     return std::chrono::duration<double, std::milli>(end - begin).count();
+}
+
+void AdvancePeriodicDeadline(Clock::time_point now, Clock::duration period,
+                             Clock::time_point* deadline) {
+    if (deadline == nullptr || now < *deadline || period <= Clock::duration::zero()) {
+        return;
+    }
+    const auto elapsed_periods = (now - *deadline) / period;
+    *deadline += period * (elapsed_periods + 1);
 }
 
 AX_U32 AlignUp(AX_U32 value, AX_U32 alignment) {
@@ -2449,12 +2502,24 @@ private:
     InferenceStatistics statistics_{};
 };
 
+struct InferenceRateSample {
+    Clock::time_point time{};
+    std::uint64_t frames{0};
+};
+
+struct InferenceRateMonitor {
+    std::deque<InferenceRateSample> samples;
+    bool below_target{false};
+    Clock::time_point last_warning{};
+};
+
 struct StatisticsTracker {
     Clock::time_point previous_time{};
     std::array<std::uint64_t, kCameraCount> decoded_frames{};
     std::array<std::uint64_t, kCameraCount> inference_frames{};
     std::array<std::uint64_t, kCameraCount> rate_skips{};
     std::array<std::uint64_t, kCameraCount> busy_drops{};
+    std::array<InferenceRateMonitor, kCameraCount> inference_rate_monitors{};
     std::uint64_t total_inference_frames{0};
     double inference_total_ms{0.0};
 };
@@ -2465,6 +2530,45 @@ std::uint64_t CounterDelta(std::uint64_t current, std::uint64_t previous) {
 
 double CounterDelta(double current, double previous) {
     return current >= previous ? current - previous : current;
+}
+
+void UpdateInferenceRateMonitor(std::size_t camera_id, Clock::time_point started,
+                                Clock::time_point now, std::uint64_t inferred,
+                                StatisticsTracker* tracker) {
+    InferenceRateMonitor& monitor = tracker->inference_rate_monitors[camera_id];
+    if (monitor.samples.empty()) {
+        monitor.samples.push_back({started, 0});
+    }
+    monitor.samples.push_back({now, inferred});
+
+    const auto window_start = now - kInferenceRateWindow;
+    while (monitor.samples.size() > 1 && monitor.samples[1].time <= window_start) {
+        monitor.samples.pop_front();
+    }
+
+    const double window_seconds = ElapsedSeconds(monitor.samples.front().time, now);
+    if (window_seconds < static_cast<double>(kInferenceRateWindow.count())) {
+        return;
+    }
+
+    const double inference_fps =
+        static_cast<double>(CounterDelta(inferred, monitor.samples.front().frames)) /
+        std::max(window_seconds, 0.001);
+    const bool below_target = inference_fps < kMinimumInferenceFps;
+    if (below_target) {
+        const bool repeat_due =
+            monitor.last_warning == Clock::time_point{} ||
+            now - monitor.last_warning >= kLowInferenceWarningRepeat;
+        if (!monitor.below_target || repeat_due) {
+            LogWarning("[PERF] camera=%zu rolling_10s_infer_fps=%.2f below target=%.1f",
+                       camera_id, inference_fps, kMinimumInferenceFps);
+            monitor.last_warning = now;
+        }
+    } else if (monitor.below_target) {
+        LogConsoleInfo("[PERF] camera=%zu rolling_10s_infer_fps=%.2f recovered target=%.1f",
+                       camera_id, inference_fps, kMinimumInferenceFps);
+    }
+    monitor.below_target = below_target;
 }
 
 void RequestGlobalFailure(std::atomic<bool>* stop_requested, std::atomic<bool>* failed,
@@ -2528,7 +2632,7 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
                 ++route->rate_skips;
                 return true;
             }
-            route->next_candidate = now + kInferencePeriod;
+            AdvancePeriodicDeadline(now, kInferencePeriod, &route->next_candidate);
 
             std::unique_lock<std::mutex> slot_lock(route->slot_mutex, std::try_to_lock);
             if (!slot_lock.owns_lock() || route->slot_writing || route->slot_copying) {
@@ -2765,6 +2869,7 @@ void PrintMultiStatistics(const Options& options, Clock::time_point started,
                           const InferenceSharedState& inference_state, const char* tag,
                           StatisticsTracker* tracker) {
     const auto now = Clock::now();
+    const bool is_final = std::strcmp(tag, "FINAL") == 0;
     const double interval_seconds =
         std::max(ElapsedSeconds(tracker->previous_time, now), 0.001);
     const double elapsed_seconds = std::max(ElapsedSeconds(started, now), 0.001);
@@ -2778,7 +2883,9 @@ void PrintMultiStatistics(const Options& options, Clock::time_point started,
                                             : interval_inference_ms /
                                                   static_cast<double>(interval_inference_frames);
 
+    std::string log_cameras;
     std::string console_cameras;
+    std::string final_console_cameras;
     double total_decoded_fps = 0.0;
     double total_inference_fps = 0.0;
     std::uint64_t total_errors = inference.errors;
@@ -2790,27 +2897,41 @@ void PrintMultiStatistics(const Options& options, Clock::time_point started,
         const std::uint64_t infer_errors = route.inference_errors.load(std::memory_order_relaxed);
         const std::uint64_t detections = route.detections.load(std::memory_order_relaxed);
 
+        const std::uint64_t interval_decoded_frames =
+            CounterDelta(snapshot.vdec.decoded_frames, tracker->decoded_frames[camera_id]);
+        const std::uint64_t interval_inferred_frames =
+            CounterDelta(inferred, tracker->inference_frames[camera_id]);
         const double decoded_fps =
-            static_cast<double>(CounterDelta(snapshot.vdec.decoded_frames,
-                                             tracker->decoded_frames[camera_id])) /
-            interval_seconds;
+            static_cast<double>(interval_decoded_frames) / interval_seconds;
         const double infer_fps =
-            static_cast<double>(CounterDelta(inferred,
-                                             tracker->inference_frames[camera_id])) /
-            interval_seconds;
+            static_cast<double>(interval_inferred_frames) / interval_seconds;
         const std::uint64_t interval_rate_skips =
             CounterDelta(snapshot.rate_skips, tracker->rate_skips[camera_id]);
         const std::uint64_t interval_busy_drops =
             CounterDelta(snapshot.busy_drops, tracker->busy_drops[camera_id]);
 
-        char camera_text[256]{};
-        std::snprintf(camera_text, sizeof(camera_text),
+        char log_camera_text[256]{};
+        std::snprintf(log_camera_text, sizeof(log_camera_text),
                       "%scam%zu[%s] dec=%.1f infer=%.1f rate_skips=%llu busy_drops=%llu",
                       camera_id == 0 ? "" : " | ", camera_id,
                       CameraRunStateName(snapshot.state), decoded_fps, infer_fps,
                       static_cast<unsigned long long>(interval_rate_skips),
                       static_cast<unsigned long long>(interval_busy_drops));
-        console_cameras += camera_text;
+        log_cameras += log_camera_text;
+
+        char console_camera_text[96]{};
+        std::snprintf(console_camera_text, sizeof(console_camera_text),
+                      "%sc%zu dec=%.1f infer=%.1f", camera_id == 0 ? "" : " | ",
+                      camera_id, decoded_fps, infer_fps);
+        console_cameras += console_camera_text;
+
+        char final_console_camera_text[128]{};
+        std::snprintf(final_console_camera_text, sizeof(final_console_camera_text),
+                      "%sc%zu dec=%llu infer=%llu", camera_id == 0 ? "" : " | ",
+                      camera_id,
+                      static_cast<unsigned long long>(snapshot.vdec.decoded_frames),
+                      static_cast<unsigned long long>(inferred));
+        final_console_cameras += final_console_camera_text;
         total_decoded_fps += decoded_fps;
         total_inference_fps += infer_fps;
         total_errors += snapshot.ffmpeg_errors + snapshot.vdec.errors +
@@ -2866,6 +2987,10 @@ void PrintMultiStatistics(const Options& options, Clock::time_point started,
                 static_cast<unsigned long long>(snapshot.ffmpeg_errors),
                 static_cast<unsigned long long>(snapshot.skipped_before_idr));
 
+        if (options.mode == RunMode::kInfer && !is_final) {
+            UpdateInferenceRateMonitor(camera_id, started, now, inferred, tracker);
+        }
+
         tracker->decoded_frames[camera_id] = snapshot.vdec.decoded_frames;
         tracker->inference_frames[camera_id] = inferred;
         tracker->rate_skips[camera_id] = snapshot.rate_skips;
@@ -2874,11 +2999,16 @@ void PrintMultiStatistics(const Options& options, Clock::time_point started,
 
     const double candidate_limit =
         options.mode == RunMode::kVdecSmoke ? 0.0 : kInferenceLimitFps;
-    LogStatisticsFlush("[%s] mode=%s elapsed=%.1fs %s | total dec=%.1f infer=%.1f "
-                       "candidate_limit=%.1f/camera infer_avg_ms=%.3f errors=%llu",
-                       tag, ModeName(options.mode), elapsed_seconds, console_cameras.c_str(),
-                       total_decoded_fps, total_inference_fps, candidate_limit,
-                       inference_average_ms, static_cast<unsigned long long>(total_errors));
+    LogInfoFlush("[%s] mode=%s elapsed=%.1fs %s | total dec=%.1f infer=%.1f "
+                 "candidate_limit=%.1f/camera infer_avg_ms=%.3f errors=%llu",
+                 tag, ModeName(options.mode), elapsed_seconds, log_cameras.c_str(),
+                 total_decoded_fps, total_inference_fps, candidate_limit,
+                 inference_average_ms, static_cast<unsigned long long>(total_errors));
+    if (is_final) {
+        PrintConsoleLine("[FINAL] %s", final_console_cameras.c_str());
+    } else {
+        PrintConsoleLine("[STATS] %s", console_cameras.c_str());
+    }
 
     tracker->previous_time = now;
     tracker->total_inference_frames = inference.frames;
@@ -3078,10 +3208,13 @@ int Run(const Options& options) {
                 kCameraCount);
     }
     if (options.mode != RunMode::kVdecSmoke) {
-        LogInfo("[CONFIG] candidate_limit=%.1f FPS/camera period=%lldms phase_step=%lldms "
-                "no catch-up, no reconnect",
-                kInferenceLimitFps, static_cast<long long>(kInferencePeriod.count()),
-                static_cast<long long>(kCameraPhaseStep.count()));
+        const double inference_period_ms =
+            std::chrono::duration<double, std::milli>(kInferencePeriod).count();
+        const double camera_phase_step_ms =
+            std::chrono::duration<double, std::milli>(kCameraPhaseStep).count();
+        LogInfo("[CONFIG] candidate_limit=%.1f FPS/camera period=%.3fms phase_step=%.3fms "
+                "fixed timeline, skip missed slots, no reconnect",
+                kInferenceLimitFps, inference_period_ms, camera_phase_step_ms);
     }
     if (!options.dump_ivps.empty()) {
         LogInfo("[CONFIG] --dump-ivps writes camera 0 only");
@@ -3163,7 +3296,7 @@ int Run(const Options& options) {
                 !stop_requested.load(std::memory_order_relaxed)) {
                 PrintMultiStatistics(options, processing_started, routes, inference_state,
                                      "STATS", &statistics_tracker);
-                next_statistics = now + statistics_period;
+                AdvancePeriodicDeadline(Clock::now(), statistics_period, &next_statistics);
             }
         }
     }

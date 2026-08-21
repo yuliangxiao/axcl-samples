@@ -178,11 +178,16 @@ build-native\examples\axcl\ax_yolo26_rtsp_native.exe
 `[DETECTION]`、周期统计、FFmpeg、AXCL、VDEC、IVPS 和推理日志均写入该文件。AXCL SDK 自身生成的
 `axcl_logs.txt` 继续单独保存，不与应用日志合并。
 
-逐帧检测、正常信息和警告不输出到控制台；默认每秒将一条 `[STATS]` 四路增量统计同时写入日志和
-原始控制台。统计包含每路 `decoded_fps`、`infer_fps`、`rate_skips`、`busy_drops`，以及合计推理 FPS、
-模型平均耗时和累计错误数。应用检测到无法继续运行的错误时，会立即将错误同时写入日志和原始控制台，
-并在第一次错误后显示日志绝对路径。`--help` 和参数错误直接显示在控制台，不创建运行日志。日志目录或
-文件创建失败时，程序会在控制台报错并停止运行。可用 `--stats-interval` 修改统计间隔，默认值为 `1` 秒。
+日志初始化成功后，控制台先显示一次日志绝对路径。逐帧检测、模型信息和其他正常细节只写日志文件；
+默认每秒在控制台输出一条简短摘要，例如
+`[STATS] c0 dec=25.0 infer=11.0 | c1 ...`；其中 `dec` 是解码 FPS，`infer` 是推理 FPS。
+日志文件中的 `[STATS]` 继续保留每路状态、`rate_skips`、`busy_drops`、合计推理 FPS、模型平均耗时和
+累计错误数，退出时控制台额外显示一条四路累计帧数 `[FINAL]`。警告和错误会立即同时写入日志与控制台；
+`--help` 和参数错误直接显示在控制台，不创建运行日志。日志目录或文件创建失败时，程序会在控制台报错
+并停止运行。可用 `--stats-interval` 修改统计间隔，默认值为 `1` 秒。
+
+完整推理模式会在推理启动满 10 秒后监测每路滚动 10 秒推理 FPS。低于 `10` 时输出性能警告但继续
+运行：进入低帧率状态时立即提示，持续异常最多每 30 秒重复一次，恢复后提示一次。
 
 在 Windows 中直接双击 `.exe`，程序结束后会提示按任意键关闭窗口；从已有 Developer Command Prompt
 或其他共享控制台启动时不会暂停。IDE（集成开发环境）或脚本如果为程序创建独立控制台，也可能触发
@@ -226,7 +231,7 @@ build-native\examples\axcl\ax_yolo26_rtsp_native.exe --mode ivps-smoke --duratio
 验收条件：
 
 - 阶段一的条件继续成立；
-- 每路 `ivps_frames` 以不超过 10 FPS 的速度增加且 `ivps_errors=0`；
+- 每路 `ivps_frames` 长期以不超过 11 FPS 的速度增加且 `ivps_errors=0`；
 - `native_640x640.bgr` 恰好为 `1228800` 字节；
 - 诊断帧是 640×640 packed BGR，2560×1440 内容应缩放为 640×360，并在上、下各产生 140 像素黑边。
 
@@ -244,17 +249,18 @@ build-native\examples\axcl\ax_yolo26_rtsp_native.exe --mode infer --duration 60 
 验收条件：
 
 - 启动日志包含 `fixed runner input ready`、`auto_sync_before=false` 和 `auto_sync_after=true`；
-- 每路 `infer_fps` 不超过 10，四路公平调度；如果单推理实例不足 40 FPS，旧候选帧会被最新帧覆盖而不积压；
+- 每路候选上限为 11 FPS，推理启动满 10 秒后的滚动 10 秒 `infer_fps` 应不低于 10，且四路公平调度；
+  如果单推理实例不足以处理约 44 FPS，旧候选帧会被最新帧覆盖而不积压；
 - 四路 `infer_frames` 均持续增加、`infer_errors=0`，日志中的每条 `[DETECTION]` 都包含 `camera=0～3`；
 - VDEC、IVPS、FFmpeg 错误计数仍为 0；
 - 正式链路没有 Host 视频解码、resize、CSC 或 NPU 输入 H2D（主机到设备）复制；每个候选帧只执行
   一次约 1.2 MB 的设备内 D2D 复制。
 
 首版固定为四路、H.264、2560×1440、RTSP over TCP。四条连接各自使用一个解码线程、Runtime Context
-（运行时上下文）、VDEC Group 和 IVPS 最新帧槽；四路共享一个模型和一个推理线程。每路使用单调时钟
-限制为最多 10 FPS，四路相位错开 25 ms，不补做历史帧。程序不自动重连；任意一路读取超时、流结束
-或处理失败时会记录错误并停止全部路线。`--duration 0` 表示持续运行直到 Ctrl+C 或发生错误，与累计
-识别帧数无关。
+（运行时上下文）、VDEC Group 和 IVPS 最新帧槽；四路共享一个模型和一个推理线程。每路使用固定单调
+时间轴限制为最多 11 FPS，四路相位按约 90.909 ms 的周期均匀错开；错过的节拍直接跳过，只处理最新帧，
+不补做历史帧。程序不自动重连；任意一路读取超时、流结束或处理失败时会记录错误并停止全部路线。
+`--duration 0` 表示持续运行直到 Ctrl+C 或发生错误，与累计识别帧数无关。
 
 ### 每秒刷新 AX8850 设备状态
 
