@@ -169,6 +169,26 @@ build-native\examples\axcl\ax_yolo26_rtsp_native.exe
 
 也可以通过 `--model`/`-m` 和 `--source`/`-s` 覆盖默认值。下列命令中的 RTSP URL 只作为覆盖格式示例，请替换为实际地址。程序日志会隐藏密码，但共享默认地址仍以明文存在于 `examples\axcl\yolo26_defaults.hpp` 中。
 
+程序通过命令行正常启动后，会在当前工作目录的 `log` 文件夹中创建独立日志文件，命名格式为
+`ax_yolo26_rtsp_native_日期_时间_毫秒_pid进程号.log`。应用日志统一带本地毫秒时间戳；逐帧
+`[DETECTION]`、周期统计、FFmpeg、AXCL、VDEC、IVPS 和推理日志均写入该文件。AXCL SDK 自身生成的
+`axcl_logs.txt` 继续单独保存，不与应用日志合并。
+
+正常信息和警告不再输出到控制台。应用检测到无法继续运行的错误时，会立即将错误同时写入日志和原始
+控制台，并在第一次错误后显示日志绝对路径。`--help` 和参数错误直接显示在控制台，不创建运行日志。
+日志目录或文件创建失败时，程序会在控制台报错并停止运行。
+
+在 Windows 中直接双击 `.exe`，程序结束后会提示按任意键关闭窗口；从已有 Developer Command Prompt
+或其他共享控制台启动时不会暂停。IDE（集成开发环境）或脚本如果为程序创建独立控制台，也可能触发
+暂停，自动化场景应显式传入 `--no-pause`。如果缺少 DLL，Windows 加载器可能在程序进入 `main()` 前
+终止进程，此时程序内部无法保持控制台窗口，应从 Developer Command Prompt 启动以查看系统错误。
+Linux 不启用退出暂停。
+
+VDEC 统计额外包含 `attempted_au`、`send_calls`、`send_failures`、`send_task_timeouts`、`slow_sends`、
+`send_avg_ms` 和 `send_max_ms`；其中 `send_calls` 还包含队列满重试和 EOS（码流结束标记）发送。单次
+`AXCL_VDEC_SendStream` 达到 `50 ms` 会记录慢调用；送流失败时会记录错误码分解、PTS、数据大小和一次
+故障现场 `AXCL_VDEC_QueryStatus` 快照。诊断不会重发结果不确定的 AU，也不会改变原有的失败退出策略。
+
 ### 阶段一：VDEC smoke
 
 ```cmd
@@ -181,6 +201,7 @@ build-native\examples\axcl\ax_yolo26_rtsp_native.exe --mode vdec-smoke --duratio
 - `input_packets`、`sent_au`、`decoded_frames` 持续增加；
 - 输出为 `2560x1440`、NV12，`decoded_fps` 接近视频源帧率；
 - 最终日志中 `vdec_errors=0`、`vdec_hw_errors=0`、`ffmpeg_errors=0`；
+- `send_failures=0`、`send_task_timeouts=0`；
 - `full_retries` 可以非零，但不能持续增长并导致 FPS 停滞。
 
 ### 阶段二：IVPS smoke
