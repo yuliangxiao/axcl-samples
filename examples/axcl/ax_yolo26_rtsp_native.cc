@@ -117,6 +117,9 @@ constexpr std::chrono::microseconds kCameraPhaseStep{
 constexpr double kMinimumInferenceFps = 10.0;
 constexpr std::chrono::seconds kInferenceRateWindow{10};
 constexpr std::chrono::seconds kLowInferenceWarningRepeat{30};
+constexpr std::array<std::chrono::seconds, 5> kCameraRecoveryBackoff{
+    std::chrono::seconds{1}, std::chrono::seconds{2}, std::chrono::seconds{5},
+    std::chrono::seconds{10}, std::chrono::seconds{30}};
 constexpr AX_S32 kAxclRuntimeTaskTimeout =
     AXCL_DEF_RUNTIME_ERR(AXCL_RUNTIME_TASK, AXCL_ERR_TIMEOUT);
 
@@ -797,6 +800,7 @@ H264NalSummary InspectAnnexBNals(const std::uint8_t* data, std::size_t size) {
 struct AccessUnit {
     std::vector<std::uint8_t> data;
     std::uint64_t pts_us{0};
+    H264NalSummary nals{};
 };
 
 enum class ReadResult {
@@ -819,9 +823,6 @@ public:
         annex_b_parameter_sets_.clear();
         pre_idr_parameter_sets_.clear();
         bitstream_mode_.clear();
-        input_packets_ = 0;
-        skipped_before_idr_ = 0;
-        ffmpeg_errors_ = 0;
         synthetic_pts_us_ = 0;
         reported_fps_ = 0.0;
         waiting_for_idr_ = true;
@@ -1179,6 +1180,15 @@ private:
             access_unit->data.insert(access_unit->data.end(), prefix->begin(), prefix->end());
         }
         access_unit->data.insert(access_unit->data.end(), packet.data, packet.data + packet.size);
+        access_unit->nals = summary;
+        if (prefix != nullptr) {
+            const H264NalSummary prefix_summary =
+                InspectAnnexBNals(prefix->data(), prefix->size());
+            access_unit->nals.has_sps = access_unit->nals.has_sps || prefix_summary.has_sps;
+            access_unit->nals.has_pps = access_unit->nals.has_pps || prefix_summary.has_pps;
+            access_unit->nals.has_idr = access_unit->nals.has_idr || prefix_summary.has_idr;
+            access_unit->nals.has_vcl = access_unit->nals.has_vcl || prefix_summary.has_vcl;
+        }
 
         if (waiting_for_idr_ && summary.has_idr) {
             waiting_for_idr_ = false;
@@ -1477,7 +1487,10 @@ struct VdecStatistics {
     std::uint64_t send_full_retries{0};
     std::uint64_t failure_events{0};
     std::uint64_t errors{0};
+    std::uint64_t stream_errors{0};
     std::uint64_t hardware_decode_errors{0};
+    std::uint64_t current_hardware_decode_errors{0};
+    std::uint32_t last_error_code{0};
     double send_total_ms{0.0};
     double send_max_ms{0.0};
     AX_U32 left_stream_frames{0};
@@ -1491,7 +1504,21 @@ struct VdecStatistics {
 enum class VdecSendResult {
     kSuccess,
     kNeedsIdrResync,
+    kRecoverableStreamError,
     kFatal,
+};
+
+enum class VdecDrainResult {
+    kSuccess,
+    kRecoverableStreamError,
+    kFatal,
+};
+
+struct VdecAccessUnitContext {
+    std::uint64_t sequence{0};
+    std::uint64_t pts_us{0};
+    std::size_t bytes{0};
+    H264NalSummary nals{};
 };
 
 class NativeVdec final {
@@ -1504,8 +1531,11 @@ public:
         (void)Close();
     }
 
-    bool Open(int width, int height) {
-        (void)Close();
+    bool Open(int width, int height, bool count_failure_as_fatal = true) {
+        if (!Close()) {
+            return false;
+        }
+        ResetSessionStatistics();
         const AX_U32 aligned_width = AlignUp(static_cast<AX_U32>(width), 16);
         const AX_U32 aligned_height = AlignUp(static_cast<AX_U32>(height), 16);
 
@@ -1520,7 +1550,7 @@ public:
         if (const auto ret = AXCL_VDEC_CreateGrpEx(&group_, &group_attr); ret != AX_SUCCESS) {
             group_ = -1;
             LogError("[VDEC] AXCL_VDEC_CreateGrpEx failed: 0x%08X", static_cast<unsigned int>(ret));
-            ++statistics_.errors;
+            RecordOpenFailure(count_failure_as_fatal, ret);
             return false;
         }
 
@@ -1529,7 +1559,7 @@ public:
         group_param.stVdecVideoParam.enVdecMode = VIDEO_DEC_MODE_IPB;
         if (const auto ret = AXCL_VDEC_SetGrpParam(group_, &group_param); ret != AX_SUCCESS) {
             LogError("[VDEC] AXCL_VDEC_SetGrpParam failed: 0x%08X", static_cast<unsigned int>(ret));
-            ++statistics_.errors;
+            RecordOpenFailure(count_failure_as_fatal, ret);
             (void)Close();
             return false;
         }
@@ -1548,19 +1578,19 @@ public:
             &channel_attr.stCompressInfo, PT_H264);
         if (channel_attr.u32FrameBufSize == 0) {
             LogError("[VDEC] AX_VDEC_GetPicBufferSize returned 0");
-            ++statistics_.errors;
+            RecordOpenFailure(count_failure_as_fatal);
             (void)Close();
             return false;
         }
         if (const auto ret = AXCL_VDEC_SetChnAttr(group_, kVdecChannel, &channel_attr); ret != AX_SUCCESS) {
             LogError("[VDEC] AXCL_VDEC_SetChnAttr failed: 0x%08X", static_cast<unsigned int>(ret));
-            ++statistics_.errors;
+            RecordOpenFailure(count_failure_as_fatal, ret);
             (void)Close();
             return false;
         }
         if (const auto ret = AXCL_VDEC_EnableChn(group_, kVdecChannel); ret != AX_SUCCESS) {
             LogError("[VDEC] AXCL_VDEC_EnableChn failed: 0x%08X", static_cast<unsigned int>(ret));
-            ++statistics_.errors;
+            RecordOpenFailure(count_failure_as_fatal, ret);
             (void)Close();
             return false;
         }
@@ -1569,7 +1599,7 @@ public:
         if (const auto ret = AXCL_VDEC_SetDisplayMode(group_, AX_VDEC_DISPLAY_MODE_PLAYBACK);
             ret != AX_SUCCESS) {
             LogError("[VDEC] AXCL_VDEC_SetDisplayMode failed: 0x%08X", static_cast<unsigned int>(ret));
-            ++statistics_.errors;
+            RecordOpenFailure(count_failure_as_fatal, ret);
             (void)Close();
             return false;
         }
@@ -1577,7 +1607,7 @@ public:
         receive_param.s32RecvPicNum = -1;
         if (const auto ret = AXCL_VDEC_StartRecvStream(group_, &receive_param); ret != AX_SUCCESS) {
             LogError("[VDEC] AXCL_VDEC_StartRecvStream failed: 0x%08X", static_cast<unsigned int>(ret));
-            ++statistics_.errors;
+            RecordOpenFailure(count_failure_as_fatal, ret);
             (void)Close();
             return false;
         }
@@ -1589,7 +1619,11 @@ public:
         return true;
     }
 
-    VdecSendResult Send(const AccessUnit& access_unit, const FrameHandler& handler) {
+    VdecSendResult Send(const AccessUnit& access_unit, const FrameHandler& handler,
+                        bool* decoded_any = nullptr) {
+        if (decoded_any != nullptr) {
+            *decoded_any = false;
+        }
         const std::uint64_t access_unit_sequence = ++statistics_.attempted_access_units;
         if (group_ < 0 || access_unit.data.empty() ||
             access_unit.data.size() > static_cast<std::size_t>(std::numeric_limits<AX_U32>::max())) {
@@ -1598,6 +1632,9 @@ public:
                      static_cast<unsigned long long>(access_unit_sequence), group_, access_unit.data.size());
             return VdecSendResult::kFatal;
         }
+
+        const VdecAccessUnitContext access_unit_context{
+            access_unit_sequence, access_unit.pts_us, access_unit.data.size(), access_unit.nals};
 
         AX_VDEC_STREAM_T stream{};
         stream.u64PTS = access_unit.pts_us;
@@ -1614,27 +1651,62 @@ public:
             if (call.result == AX_SUCCESS) {
                 statistics_.consecutive_task_timeouts = 0;
                 ++statistics_.sent_access_units;
-                return DrainAvailable(handler, 0, nullptr) ? VdecSendResult::kSuccess
-                                                           : VdecSendResult::kFatal;
+                ++session_sent_access_units_;
+                last_submitted_access_unit_ = access_unit_context;
+                bool received = false;
+                const VdecDrainResult drain_result =
+                    DrainAvailable(handler, 0, &received, nullptr, &access_unit_context);
+                if (decoded_any != nullptr && received) {
+                    *decoded_any = true;
+                }
+                return ToSendResult(drain_result);
             }
             if (call.result == kAxclRuntimeTaskTimeout) {
                 return RecoverRuntimeTaskTimeout(call, stream, access_unit_sequence,
-                                                 retry_index, handler);
+                                                 retry_index, handler, access_unit_context,
+                                                 decoded_any);
             }
             if (!IsBufferPressure(call.result)) {
-                ++statistics_.errors;
+                bool recoverable_stream_error = call.result == AX_ERR_VDEC_STRM_ERROR;
                 const std::uint64_t failure_event_id =
                     RecordSendFailure(call, stream, "data", access_unit_sequence, retry_index);
                 AX_VDEC_GRP_STATUS_T status{};
-                (void)QueryFailureStatusSnapshot(failure_event_id, &status);
+                const bool status_available =
+                    QueryFailureStatusSnapshot(failure_event_id, &status);
+                recoverable_stream_error =
+                    recoverable_stream_error ||
+                    (status_available && session_hardware_decode_errors_ != 0);
+                if (recoverable_stream_error) {
+                    ++statistics_.stream_errors;
+                    if (call.result != AX_ERR_VDEC_STRM_ERROR) {
+                        LogError("[VDEC] SendStream failure exposed recoverable hardware decode "
+                                 "fault: event=%llu original_ret=0x%08X current_hw_errors=%llu",
+                                 static_cast<unsigned long long>(failure_event_id),
+                                 static_cast<unsigned int>(call.result),
+                                 static_cast<unsigned long long>(
+                                     session_hardware_decode_errors_));
+                    }
+                    if (!status_available) {
+                        LogError("[VDEC][FAULT_STATUS] event=%llu status_unavailable=1; "
+                                 "single-camera recovery will still be attempted",
+                                 static_cast<unsigned long long>(failure_event_id));
+                    }
+                    return VdecSendResult::kRecoverableStreamError;
+                }
+                ++statistics_.errors;
                 return VdecSendResult::kFatal;
             }
 
             ++statistics_.send_full_retries;
             ++retry_index;
             bool received = false;
-            if (!DrainAvailable(handler, kAxWaitMs, &received)) {
-                return VdecSendResult::kFatal;
+            const VdecDrainResult drain_result =
+                DrainAvailable(handler, kAxWaitMs, &received, nullptr, &access_unit_context);
+            if (decoded_any != nullptr && received) {
+                *decoded_any = true;
+            }
+            if (drain_result != VdecDrainResult::kSuccess) {
+                return ToSendResult(drain_result);
             }
             if (!received) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -1674,7 +1746,7 @@ public:
             }
             ++statistics_.send_full_retries;
             ++retry_index;
-            if (!DrainAvailable(handler, kAxWaitMs, nullptr)) {
+            if (DrainAvailable(handler, kAxWaitMs, nullptr) != VdecDrainResult::kSuccess) {
                 return false;
             }
         }
@@ -1687,7 +1759,8 @@ public:
         const auto drain_deadline = Clock::now() + std::chrono::seconds(10);
         while (Clock::now() < drain_deadline) {
             bool flow_end = false;
-            if (!DrainAvailable(handler, kAxWaitMs, nullptr, &flow_end)) {
+            if (DrainAvailable(handler, kAxWaitMs, nullptr, &flow_end) !=
+                VdecDrainResult::kSuccess) {
                 return false;
             }
             if (flow_end) {
@@ -1702,39 +1775,68 @@ public:
     bool Close() {
         bool successful = true;
         if (group_ >= 0 && started_) {
-            successful = RecordCleanupResult("AXCL_VDEC_StopRecvStream",
-                                             AXCL_VDEC_StopRecvStream(group_)) && successful;
-            successful = RecordCleanupResult("AXCL_VDEC_ResetGrp",
-                                             AXCL_VDEC_ResetGrp(group_)) && successful;
-            started_ = false;
+            const bool stop_successful = RecordVdecCleanupResult(
+                "AXCL_VDEC_StopRecvStream", AXCL_VDEC_StopRecvStream(group_));
+            const bool reset_successful =
+                RecordVdecCleanupResult("AXCL_VDEC_ResetGrp", AXCL_VDEC_ResetGrp(group_));
+            successful = stop_successful && reset_successful && successful;
+            if (stop_successful || reset_successful) {
+                started_ = false;
+            }
         }
         if (group_ >= 0 && channel_enabled_) {
-            successful = RecordCleanupResult("AXCL_VDEC_DisableChn",
-                                             AXCL_VDEC_DisableChn(group_, kVdecChannel)) && successful;
-            channel_enabled_ = false;
+            const bool disable_successful = RecordVdecCleanupResult(
+                "AXCL_VDEC_DisableChn", AXCL_VDEC_DisableChn(group_, kVdecChannel));
+            successful = disable_successful && successful;
+            if (disable_successful) {
+                channel_enabled_ = false;
+            }
         }
         if (group_ >= 0) {
-            successful = RecordCleanupResult("AXCL_VDEC_DestroyGrp",
-                                             AXCL_VDEC_DestroyGrp(group_)) && successful;
-            group_ = -1;
+            const bool destroy_successful =
+                RecordVdecCleanupResult("AXCL_VDEC_DestroyGrp", AXCL_VDEC_DestroyGrp(group_));
+            successful = destroy_successful && successful;
+            if (destroy_successful) {
+                group_ = -1;
+                channel_enabled_ = false;
+                started_ = false;
+            }
+        }
+        last_cleanup_successful_ = successful;
+        if (!successful) {
+            ++statistics_.errors;
         }
         return successful;
     }
 
     const VdecStatistics& statistics() const { return statistics_; }
+    bool is_open() const { return group_ >= 0 && started_; }
+    AX_VDEC_GRP group() const { return group_; }
+    bool last_cleanup_successful() const { return last_cleanup_successful_; }
+    std::uint64_t current_hardware_decode_errors() const {
+        return session_hardware_decode_errors_;
+    }
 
-    bool RefreshStatus() {
+    bool RefreshStatus(bool record_recoverable_hardware_fault = false) {
         if (group_ < 0) {
             return false;
         }
         AX_VDEC_GRP_STATUS_T status{};
+        const auto begin = Clock::now();
         const auto ret = AXCL_VDEC_QueryStatus(group_, &status);
+        const double query_ms = ElapsedMilliseconds(begin);
         if (ret != AX_SUCCESS) {
             ++statistics_.errors;
+            statistics_.last_error_code = static_cast<std::uint32_t>(ret);
             LogError("[VDEC] AXCL_VDEC_QueryStatus failed: 0x%08X", static_cast<unsigned int>(ret));
             return false;
         }
+        const std::uint64_t previous_session_errors = session_hardware_decode_errors_;
         UpdateStatusStatistics(status);
+        if (record_recoverable_hardware_fault && previous_session_errors == 0 &&
+            session_hardware_decode_errors_ != 0) {
+            RecordStatusHardwareFault(status, query_ms);
+        }
         return true;
     }
 
@@ -1744,6 +1846,120 @@ private:
         std::uint64_t call_sequence{0};
         double elapsed_ms{0.0};
     };
+
+    static VdecSendResult ToSendResult(VdecDrainResult result) {
+        switch (result) {
+        case VdecDrainResult::kSuccess:
+            return VdecSendResult::kSuccess;
+        case VdecDrainResult::kRecoverableStreamError:
+            return VdecSendResult::kRecoverableStreamError;
+        case VdecDrainResult::kFatal:
+            return VdecSendResult::kFatal;
+        }
+        return VdecSendResult::kFatal;
+    }
+
+    static std::uint64_t HardwareDecodeErrorCount(const AX_VDEC_DECODE_ERROR_T& error) {
+        const auto nonnegative = [](AX_S32 value) {
+            return value > 0 ? static_cast<std::uint64_t>(value) : 0ULL;
+        };
+        return nonnegative(error.s32FormatErr) + nonnegative(error.s32PicSizeErrSet) +
+               nonnegative(error.s32StreamUnsprt) + nonnegative(error.s32PackErr) +
+               nonnegative(error.s32RefErrSet) + nonnegative(error.s32PicBufSizeErrSet) +
+               nonnegative(error.s32StreamSizeOver) +
+               nonnegative(error.s32VdecStreamNotRelease);
+    }
+
+    static std::string HardwareDecodeCauseText(const AX_VDEC_DECODE_ERROR_T& error) {
+        std::string causes;
+        const auto append = [&](const char* name, AX_S32 value) {
+            if (value <= 0) {
+                return;
+            }
+            if (!causes.empty()) {
+                causes += ',';
+            }
+            causes += name;
+            causes += '=';
+            causes += std::to_string(value);
+        };
+        append("format", error.s32FormatErr);
+        append("pic-size", error.s32PicSizeErrSet);
+        append("stream-unsupported", error.s32StreamUnsprt);
+        append("pack", error.s32PackErr);
+        append("reference", error.s32RefErrSet);
+        append("pic-buffer-size", error.s32PicBufSizeErrSet);
+        append("stream-size-over", error.s32StreamSizeOver);
+        append("stream-not-release", error.s32VdecStreamNotRelease);
+        return causes.empty() ? "not-reported" : causes;
+    }
+
+    void RecordOpenFailure(bool count_failure_as_fatal, AX_S32 result = AX_SUCCESS) {
+        if (result != AX_SUCCESS) {
+            statistics_.last_error_code = static_cast<std::uint32_t>(result);
+        }
+        if (count_failure_as_fatal) {
+            ++statistics_.errors;
+        }
+    }
+
+    bool RecordVdecCleanupResult(const char* api, AX_S32 result) {
+        if (result != AX_SUCCESS) {
+            statistics_.last_error_code = static_cast<std::uint32_t>(result);
+        }
+        return RecordCleanupResult(api, result);
+    }
+
+    void ResetSessionStatistics() {
+        session_sent_access_units_ = 0;
+        session_hardware_decode_errors_ = 0;
+        last_submitted_access_unit_ = VdecAccessUnitContext{};
+        statistics_.current_hardware_decode_errors = 0;
+        statistics_.consecutive_task_timeouts = 0;
+        statistics_.left_stream_frames = 0;
+        statistics_.left_output_frames = 0;
+        last_cleanup_successful_ = true;
+    }
+
+    void LogFaultStatus(std::uint64_t failure_event_id, double query_ms,
+                        const AX_VDEC_GRP_STATUS_T& status) const {
+        const auto& error = status.stVdecDecErr;
+        const std::string causes = HardwareDecodeCauseText(error);
+        LogInfoFlush("[VDEC][FAULT_STATUS] event=%llu query_ms=%.3f cause=%s "
+                     "left_bytes=%u left_frames=%u left_pics=%u started=%d recv_frames=%u "
+                     "decoded_stream_frames=%u size=%ux%u input_fifo_full=%d format_err=%d "
+                     "pic_size_err=%d stream_unsupported=%d pack_err=%d ref_err=%d "
+                     "pic_buf_size_err=%d stream_size_over=%d stream_not_release=%d",
+                     static_cast<unsigned long long>(failure_event_id), query_ms, causes.c_str(),
+                     status.u32LeftStreamBytes, status.u32LeftStreamFrames,
+                     status.u32LeftPics[kVdecChannel], static_cast<int>(status.bStartRecvStream),
+                     status.u32RecvStreamFrames, status.u32DecodeStreamFrames,
+                     status.u32PicWidth, status.u32PicHeight,
+                     static_cast<int>(status.bInputFifoIsFull), error.s32FormatErr,
+                     error.s32PicSizeErrSet, error.s32StreamUnsprt, error.s32PackErr,
+                     error.s32RefErrSet, error.s32PicBufSizeErrSet, error.s32StreamSizeOver,
+                     error.s32VdecStreamNotRelease);
+    }
+
+    void RecordStatusHardwareFault(const AX_VDEC_GRP_STATUS_T& status, double query_ms) {
+        const std::uint64_t failure_event_id = ++statistics_.failure_events;
+        ++statistics_.stream_errors;
+        statistics_.last_error_code = static_cast<std::uint32_t>(AX_ERR_VDEC_STRM_ERROR);
+        LogError("[VDEC] status reported recoverable hardware decode fault: event=%llu "
+                 "ret=0x%08X current_hw_errors=%llu last_au_seq=%llu pts=%llu bytes=%zu "
+                 "nals[sps=%d pps=%d idr=%d vcl=%d]",
+                 static_cast<unsigned long long>(failure_event_id),
+                 static_cast<unsigned int>(AX_ERR_VDEC_STRM_ERROR),
+                 static_cast<unsigned long long>(session_hardware_decode_errors_),
+                 static_cast<unsigned long long>(last_submitted_access_unit_.sequence),
+                 static_cast<unsigned long long>(last_submitted_access_unit_.pts_us),
+                 last_submitted_access_unit_.bytes,
+                 last_submitted_access_unit_.nals.has_sps ? 1 : 0,
+                 last_submitted_access_unit_.nals.has_pps ? 1 : 0,
+                 last_submitted_access_unit_.nals.has_idr ? 1 : 0,
+                 last_submitted_access_unit_.nals.has_vcl ? 1 : 0);
+        LogFaultStatus(failure_event_id, query_ms, status);
+    }
 
     static bool IsBufferPressure(AX_S32 result) {
         return result == AX_ERR_VDEC_BUF_FULL || result == AX_ERR_VDEC_QUEUE_FULL;
@@ -1791,6 +2007,13 @@ private:
         }
         const std::uint64_t failure_event_id = ++statistics_.failure_events;
         const std::uint32_t code = static_cast<std::uint32_t>(call.result);
+        statistics_.last_error_code = code;
+        const char* classification = "other";
+        if (runtime_task_timeout) {
+            classification = "axcl-runtime-task-timeout";
+        } else if (call.result == AX_ERR_VDEC_STRM_ERROR) {
+            classification = "recoverable-vdec-stream-error";
+        }
         LogError("[VDEC] SendStream failed: event=%llu kind=%s call_seq=%llu au_seq=%llu retry=%llu "
                  "requested_wait_ms=%d call_ms=%.3f ret=0x%08X module=0x%02X ax_id=0x%02X "
                  "submodule=0x%02X reason=0x%02X classification=%s pts=%llu bytes=%u "
@@ -1798,12 +2021,13 @@ private:
                  static_cast<unsigned long long>(failure_event_id), kind,
                  static_cast<unsigned long long>(call.call_sequence),
                  static_cast<unsigned long long>(access_unit_sequence),
-                 static_cast<unsigned long long>(retry_index), kAxWaitMs, call.elapsed_ms, code,
+                 static_cast<unsigned long long>(retry_index), kAxWaitMs, call.elapsed_ms,
+                 static_cast<unsigned int>(code),
                  static_cast<unsigned int>((code >> 24U) & 0x7FU),
                  static_cast<unsigned int>((code >> 16U) & 0xFFU),
                  static_cast<unsigned int>((code >> 8U) & 0xFFU),
                  static_cast<unsigned int>(code & 0xFFU),
-                 runtime_task_timeout ? "axcl-runtime-task-timeout" : "other",
+                 classification,
                  static_cast<unsigned long long>(stream.u64PTS), stream.u32StreamPackLen,
                  static_cast<unsigned long long>(statistics_.sent_access_units),
                  static_cast<unsigned long long>(statistics_.decoded_frames),
@@ -1827,21 +2051,7 @@ private:
         }
 
         UpdateStatusStatistics(*status);
-        const auto& error = status->stVdecDecErr;
-        LogInfoFlush("[VDEC][FAULT_STATUS] event=%llu query_ms=%.3f left_bytes=%u left_frames=%u "
-                     "left_pics=%u started=%d recv_frames=%u decoded_stream_frames=%u size=%ux%u "
-                     "input_fifo_full=%d format_err=%d pic_size_err=%d stream_unsupported=%d "
-                     "pack_err=%d ref_err=%d pic_buf_size_err=%d stream_size_over=%d "
-                     "stream_not_release=%d",
-                     static_cast<unsigned long long>(failure_event_id), query_ms,
-                     status->u32LeftStreamBytes, status->u32LeftStreamFrames,
-                     status->u32LeftPics[kVdecChannel], static_cast<int>(status->bStartRecvStream),
-                     status->u32RecvStreamFrames, status->u32DecodeStreamFrames,
-                     status->u32PicWidth, status->u32PicHeight,
-                     static_cast<int>(status->bInputFifoIsFull),
-                     error.s32FormatErr, error.s32PicSizeErrSet, error.s32StreamUnsprt,
-                     error.s32PackErr, error.s32RefErrSet, error.s32PicBufSizeErrSet,
-                     error.s32StreamSizeOver, error.s32VdecStreamNotRelease);
+        LogFaultStatus(failure_event_id, query_ms, *status);
         return true;
     }
 
@@ -1849,7 +2059,9 @@ private:
                                              const AX_VDEC_STREAM_T& stream,
                                              std::uint64_t access_unit_sequence,
                                              std::uint64_t retry_index,
-                                             const FrameHandler& handler) {
+                                             const FrameHandler& handler,
+                                             const VdecAccessUnitContext& access_unit_context,
+                                             bool* decoded_any) {
         // The device may have accepted this AU even though the Host task response timed out.
         // Re-sending it would duplicate input, so reconcile against the device counters instead.
         const std::uint64_t failure_event_id =
@@ -1864,10 +2076,19 @@ private:
             return VdecSendResult::kFatal;
         }
 
+        if (session_hardware_decode_errors_ != 0) {
+            ++statistics_.unrecovered_task_timeouts;
+            ++statistics_.stream_errors;
+            LogError("[VDEC] task timeout exposed recoverable hardware decode fault: event=%llu "
+                     "current_hw_errors=%llu",
+                     static_cast<unsigned long long>(failure_event_id),
+                     static_cast<unsigned long long>(session_hardware_decode_errors_));
+            return VdecSendResult::kRecoverableStreamError;
+        }
+
         const bool healthy = status.bStartRecvStream != AX_FALSE &&
-                             status.bInputFifoIsFull == AX_FALSE &&
-                             statistics_.hardware_decode_errors == 0;
-        const std::uint64_t expected_received_frames = statistics_.sent_access_units + 1;
+                             status.bInputFifoIsFull == AX_FALSE;
+        const std::uint64_t expected_received_frames = session_sent_access_units_ + 1;
         const bool accepted =
             static_cast<std::uint64_t>(status.u32RecvStreamFrames) >= expected_received_frames;
         const bool timeout_limit_reached =
@@ -1875,6 +2096,8 @@ private:
 
         if (accepted) {
             ++statistics_.sent_access_units;
+            ++session_sent_access_units_;
+            last_submitted_access_unit_ = access_unit_context;
         }
 
         if (!healthy || timeout_limit_reached) {
@@ -1888,9 +2111,15 @@ private:
             return VdecSendResult::kFatal;
         }
 
-        if (!DrainAvailable(handler, 0, nullptr)) {
+        bool received = false;
+        const VdecDrainResult drain_result =
+            DrainAvailable(handler, 0, &received, nullptr, &access_unit_context);
+        if (decoded_any != nullptr && received) {
+            *decoded_any = true;
+        }
+        if (drain_result != VdecDrainResult::kSuccess) {
             ++statistics_.unrecovered_task_timeouts;
-            return VdecSendResult::kFatal;
+            return ToSendResult(drain_result);
         }
 
         ++statistics_.recovered_task_timeouts;
@@ -1912,15 +2141,13 @@ private:
     }
 
     void UpdateStatusStatistics(const AX_VDEC_GRP_STATUS_T& status) {
-        const auto nonnegative = [](AX_S32 value) {
-            return value > 0 ? static_cast<std::uint64_t>(value) : 0ULL;
-        };
-        const auto& error = status.stVdecDecErr;
-        statistics_.hardware_decode_errors =
-            nonnegative(error.s32FormatErr) + nonnegative(error.s32PicSizeErrSet) +
-            nonnegative(error.s32StreamUnsprt) + nonnegative(error.s32PackErr) +
-            nonnegative(error.s32RefErrSet) + nonnegative(error.s32PicBufSizeErrSet) +
-            nonnegative(error.s32StreamSizeOver) + nonnegative(error.s32VdecStreamNotRelease);
+        const std::uint64_t current_errors = HardwareDecodeErrorCount(status.stVdecDecErr);
+        const std::uint64_t new_errors = current_errors >= session_hardware_decode_errors_
+                                             ? current_errors - session_hardware_decode_errors_
+                                             : current_errors;
+        statistics_.hardware_decode_errors += new_errors;
+        statistics_.current_hardware_decode_errors = current_errors;
+        session_hardware_decode_errors_ = current_errors;
         statistics_.left_stream_frames = status.u32LeftStreamFrames;
         statistics_.left_output_frames = status.u32LeftPics[kVdecChannel];
     }
@@ -1929,8 +2156,61 @@ private:
         return stop_requested_ != nullptr && stop_requested_->load(std::memory_order_relaxed);
     }
 
-    bool DrainAvailable(const FrameHandler& handler, AX_S32 first_wait_ms, bool* received_any,
-                        bool* flow_end = nullptr) {
+    VdecDrainResult RecordGetFrameFailure(AX_S32 result,
+                                          const VdecAccessUnitContext* access_unit_context) {
+        const std::uint32_t code = static_cast<std::uint32_t>(result);
+        statistics_.last_error_code = code;
+        const std::uint64_t failure_event_id = ++statistics_.failure_events;
+        AX_VDEC_GRP_STATUS_T status{};
+        const bool status_available =
+            QueryFailureStatusSnapshot(failure_event_id, &status);
+        const bool recoverable_stream_error =
+            result == AX_ERR_VDEC_STRM_ERROR ||
+            (status_available && session_hardware_decode_errors_ != 0);
+        if (recoverable_stream_error) {
+            ++statistics_.stream_errors;
+        } else {
+            ++statistics_.errors;
+        }
+
+        const VdecAccessUnitContext empty_context{};
+        const VdecAccessUnitContext& context =
+            access_unit_context == nullptr ? empty_context : *access_unit_context;
+        LogError("[VDEC] GetChnFrame failed: event=%llu ret=0x%08X fixed=0x%02X "
+                 "ax_id=0x%02X submodule=0x%02X reason=0x%02X classification=%s "
+                 "au_seq=%llu pts=%llu bytes=%zu nals[sps=%d pps=%d idr=%d vcl=%d] "
+                 "sent_au=%llu decoded_frames=%llu",
+                 static_cast<unsigned long long>(failure_event_id),
+                 static_cast<unsigned int>(code),
+                 static_cast<unsigned int>((code >> 24U) & 0xFFU),
+                 static_cast<unsigned int>((code >> 16U) & 0xFFU),
+                 static_cast<unsigned int>((code >> 8U) & 0xFFU),
+                 static_cast<unsigned int>(code & 0xFFU),
+                 recoverable_stream_error ? "recoverable-vdec-stream-error" : "fatal",
+                 static_cast<unsigned long long>(context.sequence),
+                 static_cast<unsigned long long>(context.pts_us), context.bytes,
+                 context.nals.has_sps ? 1 : 0, context.nals.has_pps ? 1 : 0,
+                 context.nals.has_idr ? 1 : 0, context.nals.has_vcl ? 1 : 0,
+                 static_cast<unsigned long long>(statistics_.sent_access_units),
+                 static_cast<unsigned long long>(statistics_.decoded_frames));
+
+        if (!status_available) {
+            if (recoverable_stream_error) {
+                LogError("[VDEC][FAULT_STATUS] event=%llu status_unavailable=1; "
+                         "single-camera recovery will still be attempted",
+                         static_cast<unsigned long long>(failure_event_id));
+            } else {
+                LogError("[VDEC][FAULT_STATUS] event=%llu status_unavailable=1",
+                         static_cast<unsigned long long>(failure_event_id));
+            }
+        }
+        return recoverable_stream_error ? VdecDrainResult::kRecoverableStreamError
+                                        : VdecDrainResult::kFatal;
+    }
+
+    VdecDrainResult DrainAvailable(const FrameHandler& handler, AX_S32 first_wait_ms,
+                                   bool* received_any, bool* flow_end = nullptr,
+                                   const VdecAccessUnitContext* access_unit_context = nullptr) {
         if (received_any != nullptr) {
             *received_any = false;
         }
@@ -1946,17 +2226,14 @@ private:
                 if (flow_end != nullptr) {
                     *flow_end = true;
                 }
-                return true;
+                return VdecDrainResult::kSuccess;
             }
             if (ret != AX_SUCCESS) {
                 if (ret == AX_ERR_VDEC_BUF_EMPTY || ret == AX_ERR_VDEC_QUEUE_EMPTY ||
                     ret == AX_ERR_VDEC_TIMED_OUT) {
-                    return true;
+                    return VdecDrainResult::kSuccess;
                 }
-                ++statistics_.errors;
-                LogError("[VDEC] AXCL_VDEC_GetChnFrame failed: 0x%08X",
-                         static_cast<unsigned int>(ret));
-                return false;
+                return RecordGetFrameFailure(ret, access_unit_context);
             }
 
             if (received_any != nullptr) {
@@ -1981,12 +2258,13 @@ private:
             const auto release_ret = AXCL_VDEC_ReleaseChnFrame(group_, kVdecChannel, &frame);
             if (release_ret != AX_SUCCESS) {
                 ++statistics_.errors;
+                statistics_.last_error_code = static_cast<std::uint32_t>(release_ret);
                 LogError("[VDEC] AXCL_VDEC_ReleaseChnFrame failed: 0x%08X",
                          static_cast<unsigned int>(release_ret));
-                return false;
+                return VdecDrainResult::kFatal;
             }
             if (!handled) {
-                return false;
+                return VdecDrainResult::kFatal;
             }
             wait_ms = 0;
         }
@@ -1996,6 +2274,10 @@ private:
     const std::atomic<bool>* stop_requested_{nullptr};
     bool channel_enabled_{false};
     bool started_{false};
+    bool last_cleanup_successful_{true};
+    std::uint64_t session_sent_access_units_{0};
+    std::uint64_t session_hardware_decode_errors_{0};
+    VdecAccessUnitContext last_submitted_access_unit_{};
     VdecStatistics statistics_{};
 };
 
@@ -2340,6 +2622,7 @@ enum class CameraRunState {
     kStarting,
     kReady,
     kRunning,
+    kReconnecting,
     kFailed,
     kStopped,
 };
@@ -2352,6 +2635,8 @@ const char* CameraRunStateName(CameraRunState state) {
         return "ready";
     case CameraRunState::kRunning:
         return "running";
+    case CameraRunState::kReconnecting:
+        return "reconnecting";
     case CameraRunState::kFailed:
         return "failed";
     case CameraRunState::kStopped:
@@ -2370,6 +2655,12 @@ struct RouteSnapshot {
     std::uint64_t rate_skips{0};
     std::uint64_t busy_drops{0};
     std::uint64_t latest_replacements{0};
+    std::uint64_t recovery_attempts{0};
+    std::uint64_t recovery_successes{0};
+    std::uint64_t recovery_failures{0};
+    std::uint64_t recovered_ffmpeg_errors{0};
+    double completed_recovery_downtime_ms{0.0};
+    Clock::time_point recovery_started{};
 };
 
 struct FrameSlotMetadata {
@@ -2399,6 +2690,12 @@ public:
         next.rate_skips = rate_skips;
         next.busy_drops = busy_drops;
         next.latest_replacements = latest_replacements;
+        next.recovery_attempts = recovery_attempts;
+        next.recovery_successes = recovery_successes;
+        next.recovery_failures = recovery_failures;
+        next.recovered_ffmpeg_errors = recovered_ffmpeg_errors;
+        next.completed_recovery_downtime_ms = completed_recovery_downtime_ms;
+        next.recovery_started = recovery_started;
         std::lock_guard<std::mutex> lock(snapshot_mutex);
         snapshot = next;
     }
@@ -2424,6 +2721,13 @@ public:
     std::uint64_t rate_skips{0};
     std::uint64_t busy_drops{0};
     std::uint64_t latest_replacements{0};
+    std::uint64_t recovery_attempts{0};
+    std::uint64_t recovery_successes{0};
+    std::uint64_t recovery_failures{0};
+    std::uint64_t recovered_ffmpeg_errors{0};
+    std::uint64_t recovery_ffmpeg_error_baseline{0};
+    double completed_recovery_downtime_ms{0.0};
+    Clock::time_point recovery_started{};
     bool raw_dump_written{false};
 
     std::atomic<std::uint64_t> inference_frames{0};
@@ -2532,6 +2836,12 @@ double CounterDelta(double current, double previous) {
     return current >= previous ? current - previous : current;
 }
 
+std::uint64_t UnrecoveredFfmpegErrors(const RouteSnapshot& snapshot) {
+    return snapshot.ffmpeg_errors >= snapshot.recovered_ffmpeg_errors
+               ? snapshot.ffmpeg_errors - snapshot.recovered_ffmpeg_errors
+               : snapshot.ffmpeg_errors;
+}
+
 void UpdateInferenceRateMonitor(std::size_t camera_id, Clock::time_point started,
                                 Clock::time_point now, std::uint64_t inferred,
                                 StatisticsTracker* tracker) {
@@ -2580,6 +2890,29 @@ void RequestGlobalFailure(std::atomic<bool>* stop_requested, std::atomic<bool>* 
     lifecycle_condition->notify_all();
 }
 
+void InvalidateLatestFrameSlot(CameraRoute* route) {
+    std::lock_guard<std::mutex> slot_lock(route->slot_mutex);
+    route->slot_ready = false;
+    route->slot_writing = false;
+    route->slot_metadata = FrameSlotMetadata{};
+}
+
+bool WaitForCameraRecovery(const std::atomic<bool>* stop_requested,
+                           std::chrono::seconds delay) {
+    const auto deadline = Clock::now() + delay;
+    constexpr auto kPollInterval = std::chrono::milliseconds{100};
+    while (!stop_requested->load(std::memory_order_relaxed)) {
+        const auto now = Clock::now();
+        if (now >= deadline) {
+            return true;
+        }
+        const auto remaining = deadline - now;
+        std::this_thread::sleep_for(
+            std::min(remaining, std::chrono::duration_cast<Clock::duration>(kPollInterval)));
+    }
+    return false;
+}
+
 void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_device_id,
                     Clock::time_point* processing_started, StartupGate* startup_gate,
                     InferenceScheduler* scheduler, std::atomic<bool>* stop_requested,
@@ -2589,6 +2922,9 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
     AxclThreadContext thread_context;
     bool startup_reported = false;
     bool route_failed = false;
+    bool recovering = false;
+    bool session_open = false;
+    std::size_t recovery_backoff_index = 0;
 
     try {
         if (!thread_context.Open(runtime_device_id) ||
@@ -2598,6 +2934,7 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
             startup_reported = true;
             return;
         }
+        session_open = true;
         route->PublishSnapshot(CameraRunState::kReady);
         startup_gate->Report(true);
         startup_reported = true;
@@ -2673,7 +3010,112 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
             return true;
         };
 
+        const auto advance_recovery_backoff = [&] {
+            recovery_backoff_index =
+                std::min(recovery_backoff_index + 1, kCameraRecoveryBackoff.size() - 1);
+        };
+
+        const auto start_or_restart_recovery = [&](const char* reason) {
+            if (recovering) {
+                ++route->recovery_failures;
+                advance_recovery_backoff();
+            } else {
+                recovering = true;
+                route->recovery_started = Clock::now();
+                route->recovery_ffmpeg_error_baseline = route->demuxer.ffmpeg_errors();
+            }
+
+            const AX_VDEC_GRP old_group = route->vdec.group();
+            const VdecStatistics fault_statistics = route->vdec.statistics();
+            LogError("[RECOVERY] camera-local recovery triggered: reason=%s old_group=%d "
+                     "last_error_code=0x%08X stream_errors=%llu current_hw_errors=%llu",
+                     reason, old_group,
+                     static_cast<unsigned int>(fault_statistics.last_error_code),
+                     static_cast<unsigned long long>(fault_statistics.stream_errors),
+                     static_cast<unsigned long long>(
+                         fault_statistics.current_hardware_decode_errors));
+
+            InvalidateLatestFrameSlot(route);
+            route->PublishSnapshot(CameraRunState::kReconnecting);
+            route->interrupt.deadline_us.store(0, std::memory_order_relaxed);
+
+            if (!thread_context.Bind()) {
+                LogError("[RECOVERY] worker context bind failed; escalating to global failure");
+                return false;
+            }
+            const bool vdec_closed = route->vdec.Close();
+            route->demuxer.Close();
+            session_open = false;
+            if (!vdec_closed) {
+                LogError("[RECOVERY] old VDEC group cleanup failed: group=%d; "
+                         "escalating to global failure",
+                         old_group);
+                return false;
+            }
+            LogInfo("[RECOVERY] old camera session closed: group=%d", old_group);
+            return true;
+        };
+
         while (!stop_requested->load(std::memory_order_relaxed)) {
+            if (recovering && !session_open) {
+                const auto delay = kCameraRecoveryBackoff[recovery_backoff_index];
+                LogWarning("[RECOVERY] retry scheduled: attempt=%llu backoff_s=%lld",
+                           static_cast<unsigned long long>(route->recovery_attempts + 1),
+                           static_cast<long long>(delay.count()));
+                route->PublishSnapshot(CameraRunState::kReconnecting);
+                if (!WaitForCameraRecovery(stop_requested, delay)) {
+                    break;
+                }
+                if (stop_requested->load(std::memory_order_relaxed)) {
+                    break;
+                }
+
+                ++route->recovery_attempts;
+                const auto attempt_started = Clock::now();
+                if (!route->demuxer.Open(options->source, options->read_timeout_ms)) {
+                    ++route->recovery_failures;
+                    advance_recovery_backoff();
+                    LogError("[RECOVERY] RTSP reopen failed: attempt=%llu elapsed_ms=%.3f",
+                             static_cast<unsigned long long>(route->recovery_attempts),
+                             ElapsedMilliseconds(attempt_started));
+                    route->PublishSnapshot(CameraRunState::kReconnecting);
+                    continue;
+                }
+                if (!thread_context.Bind()) {
+                    route->demuxer.Close();
+                    LogError("[RECOVERY] worker context rebind failed after RTSP reopen; "
+                             "escalating to global failure");
+                    route_failed = true;
+                    break;
+                }
+                if (!route->vdec.Open(kSourceWidth, kSourceHeight, false)) {
+                    ++route->recovery_failures;
+                    advance_recovery_backoff();
+                    const bool cleanup_successful = route->vdec.last_cleanup_successful();
+                    route->demuxer.Close();
+                    LogError("[RECOVERY] VDEC reopen failed: attempt=%llu elapsed_ms=%.3f "
+                             "cleanup_successful=%d",
+                             static_cast<unsigned long long>(route->recovery_attempts),
+                             ElapsedMilliseconds(attempt_started), cleanup_successful ? 1 : 0);
+                    route->PublishSnapshot(CameraRunState::kReconnecting);
+                    if (!cleanup_successful) {
+                        LogError("[RECOVERY] partial VDEC cleanup failed; "
+                                 "escalating to global failure");
+                        route_failed = true;
+                        break;
+                    }
+                    continue;
+                }
+
+                session_open = true;
+                next_status_refresh = Clock::now() + std::chrono::seconds(1);
+                LogInfo("[RECOVERY] camera session reopened: attempt=%llu new_group=%d "
+                        "elapsed_ms=%.3f state=waiting-for-idr-and-first-frame",
+                        static_cast<unsigned long long>(route->recovery_attempts),
+                        route->vdec.group(), ElapsedMilliseconds(attempt_started));
+                route->PublishSnapshot(CameraRunState::kReconnecting);
+            }
+
             AccessUnit access_unit;
             const auto read_timeout_us =
                 static_cast<std::int64_t>(options->read_timeout_ms) * 1000;
@@ -2682,24 +3124,61 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
                 if (stop_requested->load(std::memory_order_relaxed)) {
                     break;
                 }
+                if (recovering) {
+                    LogError("[RECOVERY] reopened RTSP read interrupted by timeout");
+                    if (!start_or_restart_recovery("recovery-rtsp-read-timeout")) {
+                        route_failed = true;
+                        break;
+                    }
+                    continue;
+                }
                 LogError("[FFMPEG] RTSP read interrupted by timeout");
                 route_failed = true;
                 break;
             }
             if (read_result == ReadResult::kEof) {
-                LogError("[FFMPEG] RTSP stream ended; reconnect is intentionally disabled");
+                if (recovering) {
+                    LogError("[RECOVERY] reopened RTSP stream ended before first decoded frame");
+                    if (!start_or_restart_recovery("recovery-rtsp-eof")) {
+                        route_failed = true;
+                        break;
+                    }
+                    continue;
+                }
+                LogError("[FFMPEG] RTSP stream ended; recovery is limited to VDEC stream faults");
                 route_failed = true;
                 break;
             }
             if (read_result == ReadResult::kError) {
+                if (recovering) {
+                    LogError("[RECOVERY] reopened RTSP read failed before first decoded frame");
+                    if (!start_or_restart_recovery("recovery-rtsp-read-error")) {
+                        route_failed = true;
+                        break;
+                    }
+                    continue;
+                }
                 route_failed = true;
                 break;
             }
 
-            const VdecSendResult send_result = route->vdec.Send(access_unit, frame_handler);
+            bool decoded_any = false;
+            const VdecSendResult send_result =
+                route->vdec.Send(access_unit, frame_handler, &decoded_any);
+            if (send_result == VdecSendResult::kRecoverableStreamError) {
+                if (stop_requested->load(std::memory_order_relaxed)) {
+                    break;
+                }
+                if (!start_or_restart_recovery("vdec-stream-error")) {
+                    route_failed = true;
+                    break;
+                }
+                continue;
+            }
             if (send_result == VdecSendResult::kNeedsIdrResync) {
                 route->demuxer.RequestIdrResync();
-                route->PublishSnapshot(CameraRunState::kRunning);
+                route->PublishSnapshot(recovering ? CameraRunState::kReconnecting
+                                                  : CameraRunState::kRunning);
                 continue;
             }
             if (send_result == VdecSendResult::kFatal) {
@@ -2708,25 +3187,60 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
                 }
                 break;
             }
-            if (Clock::now() >= next_status_refresh) {
-                if (!route->vdec.RefreshStatus() ||
-                    route->vdec.statistics().hardware_decode_errors != 0) {
-                    if (route->vdec.statistics().hardware_decode_errors != 0) {
-                        LogError("[VDEC] hardware decode errors=%llu",
-                                 static_cast<unsigned long long>(
-                                     route->vdec.statistics().hardware_decode_errors));
-                    }
+
+            if (recovering && decoded_any) {
+                if (!route->vdec.RefreshStatus(true)) {
                     route_failed = true;
                     break;
                 }
+                if (route->vdec.current_hardware_decode_errors() != 0) {
+                    if (!start_or_restart_recovery(
+                            "vdec-hardware-decode-error-before-first-healthy-frame")) {
+                        route_failed = true;
+                        break;
+                    }
+                    continue;
+                }
+                const double downtime_ms = ElapsedMilliseconds(route->recovery_started);
+                const std::uint64_t current_ffmpeg_errors = route->demuxer.ffmpeg_errors();
+                if (current_ffmpeg_errors >= route->recovery_ffmpeg_error_baseline) {
+                    route->recovered_ffmpeg_errors +=
+                        current_ffmpeg_errors - route->recovery_ffmpeg_error_baseline;
+                }
+                route->completed_recovery_downtime_ms += downtime_ms;
+                route->recovery_started = Clock::time_point{};
+                ++route->recovery_successes;
+                recovering = false;
+                recovery_backoff_index = 0;
+                next_status_refresh = Clock::now() + std::chrono::seconds(1);
+                LogInfo("[RECOVERY] camera recovered after first decoded frame: group=%d "
+                        "attempts=%llu successes=%llu downtime_ms=%.3f",
+                        route->vdec.group(),
+                        static_cast<unsigned long long>(route->recovery_attempts),
+                        static_cast<unsigned long long>(route->recovery_successes), downtime_ms);
+            }
+            if (Clock::now() >= next_status_refresh) {
+                if (!route->vdec.RefreshStatus(true)) {
+                    route_failed = true;
+                    break;
+                }
+                if (route->vdec.current_hardware_decode_errors() != 0) {
+                    if (!start_or_restart_recovery("vdec-hardware-decode-error")) {
+                        route_failed = true;
+                        break;
+                    }
+                    continue;
+                }
                 next_status_refresh = Clock::now() + std::chrono::seconds(1);
             }
-            route->PublishSnapshot(CameraRunState::kRunning);
+            route->PublishSnapshot(recovering ? CameraRunState::kReconnecting
+                                              : CameraRunState::kRunning);
         }
 
         if (route_failed) {
             RequestGlobalFailure(stop_requested, failed, scheduler, lifecycle_condition);
-        } else if (!thread_context.Bind() || !route->vdec.Finish(frame_handler)) {
+        } else if (!recovering && session_open &&
+                   (!thread_context.Bind() || !route->vdec.Finish(frame_handler))) {
             route_failed = true;
             RequestGlobalFailure(stop_requested, failed, scheduler, lifecycle_condition);
         }
@@ -2741,10 +3255,17 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
     if (!startup_reported) {
         startup_gate->Report(false);
     }
+    if (recovering && route->recovery_started != Clock::time_point{}) {
+        route->completed_recovery_downtime_ms +=
+            ElapsedMilliseconds(route->recovery_started);
+        route->recovery_started = Clock::time_point{};
+    }
     if (!thread_context.Close()) {
         route_failed = true;
     }
-    route->PublishSnapshot(route_failed ? CameraRunState::kFailed : CameraRunState::kStopped);
+    route->PublishSnapshot(route_failed ? CameraRunState::kFailed
+                                        : recovering ? CameraRunState::kReconnecting
+                                                     : CameraRunState::kStopped);
     if (route_failed) {
         RequestGlobalFailure(stop_requested, failed, scheduler, lifecycle_condition);
     }
@@ -2934,8 +3455,15 @@ void PrintMultiStatistics(const Options& options, Clock::time_point started,
         final_console_cameras += final_console_camera_text;
         total_decoded_fps += decoded_fps;
         total_inference_fps += infer_fps;
-        total_errors += snapshot.ffmpeg_errors + snapshot.vdec.errors +
-                        snapshot.vdec.hardware_decode_errors + snapshot.ivps.errors;
+        const std::uint64_t unrecovered_ffmpeg_errors =
+            UnrecoveredFfmpegErrors(snapshot);
+        total_errors +=
+            unrecovered_ffmpeg_errors + snapshot.vdec.errors + snapshot.ivps.errors;
+
+        double recovery_downtime_ms = snapshot.completed_recovery_downtime_ms;
+        if (snapshot.recovery_started != Clock::time_point{}) {
+            recovery_downtime_ms += ElapsedMilliseconds(snapshot.recovery_started, now);
+        }
 
         const double send_average_ms = snapshot.vdec.send_calls == 0
                                            ? 0.0
@@ -2947,14 +3475,19 @@ void PrintMultiStatistics(const Options& options, Clock::time_point started,
                                                  static_cast<double>(snapshot.ivps.frames);
         LogInfo("[%s_DETAIL] camera=%zu state=%s input_packets=%llu attempted_au=%llu "
                 "sent_au=%llu decoded_frames=%llu frame=%ux%u format=%d pts_us=%llu "
-                "vdec_errors=%llu vdec_hw_errors=%llu send_calls=%llu send_failures=%llu "
+                "vdec_errors=%llu vdec_stream_errors=%llu vdec_hw_errors=%llu "
+                "vdec_current_hw_errors=%llu last_error_code=0x%08X send_calls=%llu "
+                "send_failures=%llu "
                 "send_task_timeouts=%llu recovered_task_timeouts=%llu "
                 "unrecovered_task_timeouts=%llu consecutive_task_timeouts=%llu "
                 "max_consecutive_task_timeouts=%llu slow_sends=%llu full_retries=%llu "
                 "send_avg_ms=%.3f send_max_ms=%.3f pending_au=%u pending_frames=%u "
                 "ivps_frames=%llu ivps_errors=%llu ivps_avg_ms=%.3f infer_frames=%llu "
                 "infer_errors=%llu detections=%llu rate_skips=%llu busy_drops=%llu "
-                "latest_replacements=%llu ffmpeg_errors=%llu skipped_before_idr=%llu",
+                "latest_replacements=%llu ffmpeg_errors=%llu recovered_ffmpeg_errors=%llu "
+                "skipped_before_idr=%llu "
+                "recovery_attempts=%llu recovery_successes=%llu recovery_failures=%llu "
+                "recovery_downtime_ms=%.3f",
                 tag, camera_id, CameraRunStateName(snapshot.state),
                 static_cast<unsigned long long>(snapshot.input_packets),
                 static_cast<unsigned long long>(snapshot.vdec.attempted_access_units),
@@ -2964,7 +3497,10 @@ void PrintMultiStatistics(const Options& options, Clock::time_point started,
                 static_cast<int>(snapshot.vdec.last_format),
                 static_cast<unsigned long long>(snapshot.vdec.last_pts_us),
                 static_cast<unsigned long long>(snapshot.vdec.errors),
+                static_cast<unsigned long long>(snapshot.vdec.stream_errors),
                 static_cast<unsigned long long>(snapshot.vdec.hardware_decode_errors),
+                static_cast<unsigned long long>(snapshot.vdec.current_hardware_decode_errors),
+                static_cast<unsigned int>(snapshot.vdec.last_error_code),
                 static_cast<unsigned long long>(snapshot.vdec.send_calls),
                 static_cast<unsigned long long>(snapshot.vdec.send_failures),
                 static_cast<unsigned long long>(snapshot.vdec.send_runtime_timeouts),
@@ -2985,10 +3521,24 @@ void PrintMultiStatistics(const Options& options, Clock::time_point started,
                 static_cast<unsigned long long>(snapshot.busy_drops),
                 static_cast<unsigned long long>(snapshot.latest_replacements),
                 static_cast<unsigned long long>(snapshot.ffmpeg_errors),
-                static_cast<unsigned long long>(snapshot.skipped_before_idr));
+                static_cast<unsigned long long>(snapshot.recovered_ffmpeg_errors),
+                static_cast<unsigned long long>(snapshot.skipped_before_idr),
+                static_cast<unsigned long long>(snapshot.recovery_attempts),
+                static_cast<unsigned long long>(snapshot.recovery_successes),
+                static_cast<unsigned long long>(snapshot.recovery_failures),
+                recovery_downtime_ms);
 
         if (options.mode == RunMode::kInfer && !is_final) {
-            UpdateInferenceRateMonitor(camera_id, started, now, inferred, tracker);
+            if (snapshot.state == CameraRunState::kRunning) {
+                UpdateInferenceRateMonitor(camera_id, started, now, inferred, tracker);
+            } else {
+                InferenceRateMonitor& monitor =
+                    tracker->inference_rate_monitors[camera_id];
+                monitor.samples.clear();
+                monitor.samples.push_back({now, inferred});
+                monitor.below_target = false;
+                monitor.last_warning = Clock::time_point{};
+            }
         }
 
         tracker->decoded_frames[camera_id] = snapshot.vdec.decoded_frames;
@@ -3213,9 +3763,11 @@ int Run(const Options& options) {
         const double camera_phase_step_ms =
             std::chrono::duration<double, std::milli>(kCameraPhaseStep).count();
         LogInfo("[CONFIG] candidate_limit=%.1f FPS/camera period=%.3fms phase_step=%.3fms "
-                "fixed timeline, skip missed slots, no reconnect",
+                "fixed timeline, skip missed slots",
                 kInferenceLimitFps, inference_period_ms, camera_phase_step_ms);
     }
+    LogInfo("[CONFIG] recovery_scope=single-camera VDEC stream/hardware faults; "
+            "backoff=1,2,5,10,30s; standalone RTSP/IVPS/inference/context faults remain fatal");
     if (!options.dump_ivps.empty()) {
         LogInfo("[CONFIG] --dump-ivps writes camera 0 only");
     }
@@ -3319,7 +3871,14 @@ int Run(const Options& options) {
         for (auto& route : routes) {
             ScopedCameraLogContext log_context(static_cast<int>(route->camera_id));
             const CameraRunState final_state = route->ReadSnapshot().state;
-            if (!route->vdec.RefreshStatus()) {
+            if (route->vdec.is_open()) {
+                if (!route->vdec.RefreshStatus()) {
+                    failed.store(true, std::memory_order_relaxed);
+                }
+            } else if (final_state != CameraRunState::kReconnecting &&
+                       final_state != CameraRunState::kFailed) {
+                LogError("[FINAL] VDEC group is unexpectedly closed: state=%s",
+                         CameraRunStateName(final_state));
                 failed.store(true, std::memory_order_relaxed);
             }
             route->PublishSnapshot(final_state);
@@ -3333,14 +3892,33 @@ int Run(const Options& options) {
         CameraRoute& route = *routes[camera_id];
         const RouteSnapshot snapshot = route.ReadSnapshot();
         ScopedCameraLogContext log_context(static_cast<int>(camera_id));
-        if (snapshot.vdec.decoded_frames == 0 || snapshot.vdec.errors != 0 ||
-            snapshot.vdec.hardware_decode_errors != 0 || snapshot.ffmpeg_errors != 0) {
-            LogError("[FINAL] decode validation failed: decoded_frames=%llu vdec_errors=%llu "
-                     "vdec_hw_errors=%llu ffmpeg_errors=%llu",
+        const std::uint64_t unrecovered_ffmpeg_errors =
+            UnrecoveredFfmpegErrors(snapshot);
+        const bool route_unavailable = snapshot.state == CameraRunState::kReconnecting ||
+                                       snapshot.state == CameraRunState::kFailed ||
+                                       snapshot.state == CameraRunState::kStarting ||
+                                       snapshot.state == CameraRunState::kReady;
+        if (route_unavailable || snapshot.vdec.decoded_frames == 0 ||
+            snapshot.vdec.errors != 0 ||
+            snapshot.vdec.current_hardware_decode_errors != 0 ||
+            unrecovered_ffmpeg_errors != 0) {
+            LogError("[FINAL] decode validation failed: state=%s decoded_frames=%llu "
+                     "vdec_errors=%llu vdec_stream_errors=%llu vdec_hw_errors=%llu "
+                     "vdec_current_hw_errors=%llu ffmpeg_errors=%llu "
+                     "recovered_ffmpeg_errors=%llu recovery_attempts=%llu recovery_successes=%llu "
+                     "recovery_failures=%llu",
+                     CameraRunStateName(snapshot.state),
                      static_cast<unsigned long long>(snapshot.vdec.decoded_frames),
                      static_cast<unsigned long long>(snapshot.vdec.errors),
+                     static_cast<unsigned long long>(snapshot.vdec.stream_errors),
                      static_cast<unsigned long long>(snapshot.vdec.hardware_decode_errors),
-                     static_cast<unsigned long long>(snapshot.ffmpeg_errors));
+                     static_cast<unsigned long long>(
+                         snapshot.vdec.current_hardware_decode_errors),
+                     static_cast<unsigned long long>(snapshot.ffmpeg_errors),
+                     static_cast<unsigned long long>(snapshot.recovered_ffmpeg_errors),
+                     static_cast<unsigned long long>(snapshot.recovery_attempts),
+                     static_cast<unsigned long long>(snapshot.recovery_successes),
+                     static_cast<unsigned long long>(snapshot.recovery_failures));
             failed.store(true, std::memory_order_relaxed);
         }
         if (options.mode != RunMode::kVdecSmoke &&

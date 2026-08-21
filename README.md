@@ -187,7 +187,8 @@ build-native\examples\axcl\ax_yolo26_rtsp_native.exe
 并停止运行。可用 `--stats-interval` 修改统计间隔，默认值为 `1` 秒。
 
 完整推理模式会在推理启动满 10 秒后监测每路滚动 10 秒推理 FPS。低于 `10` 时输出性能警告但继续
-运行：进入低帧率状态时立即提示，持续异常最多每 30 秒重复一次，恢复后提示一次。
+运行：进入低帧率状态时立即提示，持续异常最多每 30 秒重复一次，恢复后提示一次。单路处于
+`reconnecting` 时暂停该路监测，并在恢复出第一帧后重新累计 10 秒窗口。
 
 在 Windows 中直接双击 `.exe`，程序结束后会提示按任意键关闭窗口；从已有 Developer Command Prompt
 或其他共享控制台启动时不会暂停。IDE（集成开发环境）或脚本如果为程序创建独立控制台，也可能触发
@@ -198,12 +199,24 @@ Linux 不启用退出暂停。
 日志文件中的每路 `[STATS_DETAIL]` 额外包含 `attempted_au`、`send_calls`、`send_failures`、
 `send_task_timeouts`、`recovered_task_timeouts`、`unrecovered_task_timeouts`、
 `consecutive_task_timeouts`、`max_consecutive_task_timeouts`、`slow_sends`、`send_avg_ms`、
-`send_max_ms`、`latest_replacements` 等累计指标；其中
+`send_max_ms`、`latest_replacements`、`vdec_stream_errors`、`last_error_code`、
+`recovery_attempts`、`recovery_successes`、`recovery_failures`、`recovered_ffmpeg_errors` 和
+`recovery_downtime_ms` 等累计指标；其中
 `send_calls` 还包含队列满重试和 EOS（码流结束标记）发送。单次 `AXCL_VDEC_SendStream` 达到 `50 ms`
 会记录慢调用；送流失败时会记录错误码分解、PTS、数据大小和一次故障现场
 `AXCL_VDEC_QueryStatus` 快照。Runtime Task（运行时任务）超时时不会重发结果不确定的 AU：设备状态确认
-已经接收时继续取帧，未确认接收时丢弃后续非 IDR 帧并从下一个 IDR 恢复；状态异常或连续三次任务超时
-视为不可恢复错误，协调停止全部四路并返回非零退出码。
+已经接收时继续取帧，未确认接收时丢弃后续非 IDR 帧并从下一个 IDR 恢复。设备状态异常如果未归类为
+下述码流/硬件解码错误，仍视为不可恢复错误；连续三次任务超时也会协调停止全部四路并返回非零退出码。
+
+`AXCL_VDEC_GetChnFrame` 返回 `AX_ERR_VDEC_STRM_ERROR`，或周期状态出现硬件解码错误时，程序会立即记录
+错误码分解、当前送流上下文的 AU 序号/PTS/字节数/NAL 类型，以及 `format_err`、`pack_err`、`ref_err`
+等完整 `AXCL_VDEC_QueryStatus` 字段；VDEC 异步队列中的实际故障帧可能早于该 AU。随后只清理故障路的
+旧帧槽、RTSP 会话和 VDEC Group，其他相机与共享推理
+继续运行。故障路按 `1、2、5、10、30` 秒退避并以 30 秒为上限持续重试；每次同时重建 RTSP 和 VDEC，
+从新连接的下一个 IDR 开始，成功解码第一帧后才恢复为 `running`。已成功恢复的历史错误不会导致非零
+退出；退出时仍处于 `reconnecting`/`failed` 则返回非零。线程 Runtime Context 绑定失败、旧 VDEC 清理
+失败、IVPS/推理错误以及普通 RTSP 读取错误仍属于全局致命错误。`vdec_errors` 只累计致命 VDEC 错误，
+可恢复码流错误单独计入 `vdec_stream_errors`；诊断默认不保存原始 H.264 视频数据。
 
 ### 阶段一：VDEC smoke
 
@@ -217,9 +230,11 @@ build-native\examples\axcl\ax_yolo26_rtsp_native.exe --mode vdec-smoke --duratio
 - 日志出现 `camera=0～3` 四路，四路 `input_packets`、`sent_au`、`decoded_frames` 均持续增加；
 - 四个 VDEC Group 均输出 `2560x1440`、NV12，各路 `decoded_fps` 接近视频源帧率；
 - 每个 Group 使用 8 个输出帧缓冲，四路合计 32 个，避免沿用原单路 32 个后直接放大四倍 CMM；
-- 最终每路日志中 `vdec_errors=0`、`vdec_hw_errors=0`、`ffmpeg_errors=0`；
-- `unrecovered_task_timeouts=0`；`send_task_timeouts=0` 最佳，若非零则必须全部计入
-  `recovered_task_timeouts`，且 `max_consecutive_task_timeouts < 3`；
+- 最终每路日志中 `vdec_errors=0`、`vdec_current_hw_errors=0`；历史 `vdec_stream_errors`、
+  `vdec_hw_errors` 以及恢复尝试期间产生的 `ffmpeg_errors` 可以非零，但必须已有对应的
+  `recovery_successes` 并计入 `recovered_ffmpeg_errors`，且退出时不处于 `reconnecting`；
+- `send_task_timeouts=0` 最佳；若非零，应全部计入 `recovered_task_timeouts`，或因同时检测到硬件解码错误而
+  触发一次成功的单路重建；`max_consecutive_task_timeouts < 3`；
 - `full_retries` 可以非零，但不能持续增长并导致 FPS 停滞。
 
 ### 阶段二：IVPS smoke
@@ -252,14 +267,16 @@ build-native\examples\axcl\ax_yolo26_rtsp_native.exe --mode infer --duration 60 
 - 每路候选上限为 11 FPS，推理启动满 10 秒后的滚动 10 秒 `infer_fps` 应不低于 10，且四路公平调度；
   如果单推理实例不足以处理约 44 FPS，旧候选帧会被最新帧覆盖而不积压；
 - 四路 `infer_frames` 均持续增加、`infer_errors=0`，日志中的每条 `[DETECTION]` 都包含 `camera=0～3`；
-- VDEC、IVPS、FFmpeg 错误计数仍为 0；
+- VDEC 致命错误、当前硬件错误和 IVPS 错误计数仍为 0；允许已成功恢复的历史
+  `vdec_stream_errors`/`vdec_hw_errors`，以及恢复尝试期间的 `ffmpeg_errors` 非零；
 - 正式链路没有 Host 视频解码、resize、CSC 或 NPU 输入 H2D（主机到设备）复制；每个候选帧只执行
   一次约 1.2 MB 的设备内 D2D 复制。
 
 首版固定为四路、H.264、2560×1440、RTSP over TCP。四条连接各自使用一个解码线程、Runtime Context
 （运行时上下文）、VDEC Group 和 IVPS 最新帧槽；四路共享一个模型和一个推理线程。每路使用固定单调
 时间轴限制为最多 11 FPS，四路相位按约 90.909 ms 的周期均匀错开；错过的节拍直接跳过，只处理最新帧，
-不补做历史帧。程序不自动重连；任意一路读取超时、流结束或处理失败时会记录错误并停止全部路线。
+不补做历史帧。程序仅对 VDEC 码流/硬件解码错误执行上述单路重建，不对普通 RTSP 超时、流结束或其他
+处理错误做通用重连；后者仍会记录错误并停止全部路线。
 `--duration 0` 表示持续运行直到 Ctrl+C 或发生错误，与累计识别帧数无关。
 
 ### 每秒刷新 AX8850 设备状态
