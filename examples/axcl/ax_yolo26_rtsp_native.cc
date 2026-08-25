@@ -35,6 +35,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -42,15 +43,16 @@
 #include <vector>
 
 #ifdef _WIN32
-#include <conio.h>
-#include <fcntl.h>
-#include <io.h>
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#include <winsock2.h>
+#include <conio.h>
+#include <fcntl.h>
+#include <io.h>
 #include <windows.h>
 #else
 #include <fcntl.h>
@@ -117,9 +119,9 @@ constexpr std::chrono::microseconds kCameraPhaseStep{
 constexpr double kMinimumInferenceFps = 10.0;
 constexpr std::chrono::seconds kInferenceRateWindow{10};
 constexpr std::chrono::seconds kLowInferenceWarningRepeat{30};
-constexpr std::array<std::chrono::seconds, 5> kCameraRecoveryBackoff{
-    std::chrono::seconds{1}, std::chrono::seconds{2}, std::chrono::seconds{5},
-    std::chrono::seconds{10}, std::chrono::seconds{30}};
+constexpr std::uint32_t kCameraRecoveryMaxAttempts = 3;
+constexpr std::chrono::seconds kCameraRecoveryRetryDelay{30};
+constexpr std::chrono::seconds kCameraRecoveryStableWindow{30};
 constexpr AX_S32 kAxclRuntimeTaskTimeout =
     AXCL_DEF_RUNTIME_ERR(AXCL_RUNTIME_TASK, AXCL_ERR_TIMEOUT);
 
@@ -766,33 +768,85 @@ struct H264NalSummary {
     bool has_pps{false};
     bool has_idr{false};
     bool has_vcl{false};
+    bool has_valid_nal{false};
+    bool has_invalid_nal{false};
 };
 
 H264NalSummary InspectAnnexBNals(const std::uint8_t* data, std::size_t size) {
     H264NalSummary summary{};
-    if (data == nullptr || size < 4) {
+    if (data == nullptr || size < 3) {
         return summary;
     }
 
-    for (std::size_t i = 0; i + 3 < size; ++i) {
-        std::size_t nal = 0;
-        if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1) {
-            nal = i + 3;
-        } else if (i + 4 < size && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 &&
-                   data[i + 3] == 1) {
-            nal = i + 4;
-        } else {
+    const auto find_start_code = [&](std::size_t from, std::size_t* start,
+                                     std::size_t* nal) {
+        if (nal == nullptr) {
+            return false;
+        }
+        for (std::size_t i = from; i + 2 < size; ++i) {
+            if (data[i] != 0 || data[i + 1] != 0) {
+                continue;
+            }
+            if (data[i + 2] == 1) {
+                if (start != nullptr) {
+                    *start = i;
+                }
+                *nal = i + 3;
+                return true;
+            }
+            if (i + 3 < size && data[i + 2] == 0 && data[i + 3] == 1) {
+                if (start != nullptr) {
+                    *start = i;
+                }
+                *nal = i + 4;
+                return true;
+            }
+        }
+        return false;
+    };
+
+    std::size_t nal = 0;
+    if (!find_start_code(0, nullptr, &nal)) {
+        return summary;
+    }
+
+    while (true) {
+        std::size_t next_start = 0;
+        std::size_t next_nal = 0;
+        const bool has_next = find_start_code(nal, &next_start, &next_nal);
+        std::size_t nal_end = has_next ? next_start : size;
+        while (nal_end > nal && data[nal_end - 1] == 0) {
+            --nal_end;
+        }
+        if (nal >= nal_end) {
+            summary.has_invalid_nal = true;
+            if (!has_next) {
+                break;
+            }
+            nal = next_nal;
             continue;
         }
-        if (nal >= size) {
-            continue;
+
+        const std::uint8_t header = data[nal];
+        const auto type = header & 0x1FU;
+        const bool supported_type = (type >= 1 && type <= 16) ||
+                                    (type >= 19 && type <= 21);
+        const bool has_payload = nal_end > nal + 1;
+        const bool valid = (header & 0x80U) == 0 && supported_type && has_payload;
+        summary.has_valid_nal = summary.has_valid_nal || valid;
+        summary.has_invalid_nal = summary.has_invalid_nal || !valid;
+        if (valid) {
+            summary.has_sps = summary.has_sps || type == 7;
+            summary.has_pps = summary.has_pps || type == 8;
+            summary.has_idr = summary.has_idr || type == 5;
+            summary.has_vcl = summary.has_vcl ||
+                              (type >= 1 && type <= 5) ||
+                              (type >= 19 && type <= 21);
         }
-        const auto type = data[nal] & 0x1FU;
-        summary.has_sps = summary.has_sps || type == 7;
-        summary.has_pps = summary.has_pps || type == 8;
-        summary.has_idr = summary.has_idr || type == 5;
-        summary.has_vcl = summary.has_vcl || (type >= 1 && type <= 5);
-        i = nal;
+        if (!has_next) {
+            break;
+        }
+        nal = next_nal;
     }
     return summary;
 }
@@ -803,12 +857,169 @@ struct AccessUnit {
     H264NalSummary nals{};
 };
 
-enum class ReadResult {
-    kPacket,
-    kEof,
+enum class RtspIoStatus {
+    kSuccess,
+    kRecoverableFailure,
+    kFatalFailure,
     kInterrupted,
-    kError,
 };
+
+enum class RtspFailureReason {
+    kNone,
+    kStopRequested,
+    kTimeout,
+    kEndOfStream,
+    kNetworkIo,
+    kInvalidState,
+    kOutOfMemory,
+    kInvalidInput,
+    kUnsupportedInput,
+    kBitstreamFilter,
+    kInvalidPacket,
+    kUnknown,
+};
+
+struct RtspOpenResult {
+    RtspIoStatus status{RtspIoStatus::kFatalFailure};
+    RtspFailureReason reason{RtspFailureReason::kUnknown};
+    int error_code{0};
+
+    bool successful() const { return status == RtspIoStatus::kSuccess; }
+};
+
+struct RtspReadResult {
+    RtspIoStatus status{RtspIoStatus::kFatalFailure};
+    RtspFailureReason reason{RtspFailureReason::kUnknown};
+    int error_code{0};
+};
+
+enum class BuildAccessUnitResult {
+    kAccepted,
+    kSkipped,
+    kFatal,
+};
+
+const char* RtspFailureReasonName(RtspFailureReason reason) {
+    switch (reason) {
+    case RtspFailureReason::kNone:
+        return "none";
+    case RtspFailureReason::kStopRequested:
+        return "stop-requested";
+    case RtspFailureReason::kTimeout:
+        return "timeout";
+    case RtspFailureReason::kEndOfStream:
+        return "end-of-stream";
+    case RtspFailureReason::kNetworkIo:
+        return "network-io";
+    case RtspFailureReason::kInvalidState:
+        return "invalid-state";
+    case RtspFailureReason::kOutOfMemory:
+        return "out-of-memory";
+    case RtspFailureReason::kInvalidInput:
+        return "invalid-input";
+    case RtspFailureReason::kUnsupportedInput:
+        return "unsupported-input";
+    case RtspFailureReason::kBitstreamFilter:
+        return "bitstream-filter";
+    case RtspFailureReason::kInvalidPacket:
+        return "invalid-packet";
+    case RtspFailureReason::kUnknown:
+        return "unknown";
+    }
+    return "unknown";
+}
+
+int FfmpegTimeoutError() {
+#ifdef ETIMEDOUT
+    return AVERROR(ETIMEDOUT);
+#elif defined(_WIN32)
+    return -WSAETIMEDOUT;
+#else
+    return AVERROR(EIO);
+#endif
+}
+
+bool IsExplicitFatalFfmpegError(int error) {
+    return error == AVERROR_INVALIDDATA || error == AVERROR(ENOMEM) ||
+           error == AVERROR(EINVAL);
+}
+
+bool IsRecoverableRtspTransportError(int error) {
+    if (error == AVERROR(EIO)) {
+        return true;
+    }
+#ifdef ETIMEDOUT
+    if (error == AVERROR(ETIMEDOUT)) {
+        return true;
+    }
+#endif
+#ifdef ECONNRESET
+    if (error == AVERROR(ECONNRESET)) {
+        return true;
+    }
+#endif
+#ifdef ECONNABORTED
+    if (error == AVERROR(ECONNABORTED)) {
+        return true;
+    }
+#endif
+#ifdef ECONNREFUSED
+    if (error == AVERROR(ECONNREFUSED)) {
+        return true;
+    }
+#endif
+#ifdef ENETDOWN
+    if (error == AVERROR(ENETDOWN)) {
+        return true;
+    }
+#endif
+#ifdef ENETUNREACH
+    if (error == AVERROR(ENETUNREACH)) {
+        return true;
+    }
+#endif
+#ifdef ENETRESET
+    if (error == AVERROR(ENETRESET)) {
+        return true;
+    }
+#endif
+#ifdef EHOSTUNREACH
+    if (error == AVERROR(EHOSTUNREACH)) {
+        return true;
+    }
+#endif
+#ifdef EHOSTDOWN
+    if (error == AVERROR(EHOSTDOWN)) {
+        return true;
+    }
+#endif
+#ifdef EPIPE
+    if (error == AVERROR(EPIPE)) {
+        return true;
+    }
+#endif
+#ifdef ENOTCONN
+    if (error == AVERROR(ENOTCONN)) {
+        return true;
+    }
+#endif
+#ifdef ESHUTDOWN
+    if (error == AVERROR(ESHUTDOWN)) {
+        return true;
+    }
+#endif
+#ifdef _WIN32
+    return error == -WSAETIMEDOUT || error == -WSAECONNRESET ||
+           error == -WSAECONNABORTED || error == -WSAECONNREFUSED ||
+           error == -WSAENETDOWN || error == -WSAENETUNREACH ||
+           error == -WSAEHOSTUNREACH || error == -WSAEHOSTDOWN ||
+           error == -WSAENETRESET ||
+           error == -WSAESHUTDOWN || error == -WSAENOTCONN ||
+           error == -WSAEDISCON;
+#else
+    return false;
+#endif
+}
 
 class FfmpegRtspDemuxer final {
 public:
@@ -818,7 +1029,7 @@ public:
         Close();
     }
 
-    bool Open(const std::string& source, int timeout_ms) {
+    RtspOpenResult Open(const std::string& source, int timeout_ms) try {
         Close();
         annex_b_parameter_sets_.clear();
         pre_idr_parameter_sets_.clear();
@@ -826,34 +1037,60 @@ public:
         synthetic_pts_us_ = 0;
         reported_fps_ = 0.0;
         waiting_for_idr_ = true;
-        bsf_eof_sent_ = false;
-        fatal_packet_error_ = false;
         timeout_us_ = static_cast<std::int64_t>(timeout_ms) * 1000;
         format_ = avformat_alloc_context();
         if (format_ == nullptr) {
             LogError("[FFMPEG] avformat_alloc_context failed");
-            return false;
+            return RecordOpenFailure(RtspFailureReason::kOutOfMemory, AVERROR(ENOMEM), false);
         }
         format_->interrupt_callback.callback = FfmpegInterruptCallback;
         format_->interrupt_callback.opaque = interrupt_;
 
         AVDictionary* options = nullptr;
-        av_dict_set(&options, "rtsp_transport", "tcp", 0);
+        struct DictionaryGuard {
+            AVDictionary** options{nullptr};
+
+            ~DictionaryGuard() {
+                if (options != nullptr) {
+                    av_dict_free(options);
+                }
+            }
+        } options_guard{&options};
+        int option_ret = av_dict_set(&options, "rtsp_transport", "tcp", 0);
 #if LIBAVFORMAT_VERSION_MAJOR >= 59
-        av_dict_set_int(&options, "timeout", timeout_us_, 0);
+        if (option_ret >= 0) {
+            option_ret = av_dict_set_int(&options, "timeout", timeout_us_, 0);
+        }
 #else
-        av_dict_set_int(&options, "stimeout", timeout_us_, 0);
+        if (option_ret >= 0) {
+            option_ret = av_dict_set_int(&options, "stimeout", timeout_us_, 0);
+        }
 #endif
+        if (option_ret < 0) {
+            LogError("[FFMPEG] input option allocation failed: %s (%d)",
+                     AvErrorText(option_ret).c_str(), option_ret);
+            av_dict_free(&options);
+            Close();
+            return RecordOpenFailure(RtspFailureReason::kOutOfMemory, option_ret, false);
+        }
 
         ArmDeadline(interrupt_, timeout_us_);
         const int open_ret = avformat_open_input(&format_, source.c_str(), nullptr, &options);
+        const bool open_stopped = StopRequested();
+        const bool open_timed_out = DeadlineExpired();
         ArmDeadline(interrupt_, 0);
+        if (open_stopped && open_ret >= 0) {
+            av_dict_free(&options);
+            Close();
+            return {RtspIoStatus::kInterrupted,
+                    RtspFailureReason::kStopRequested, AVERROR_EXIT};
+        }
         if (open_ret < 0) {
             LogError("[FFMPEG] avformat_open_input failed: %s (%d)",
                      AvErrorText(open_ret).c_str(), open_ret);
             av_dict_free(&options);
             Close();
-            return false;
+            return ClassifyOpenFailure(open_ret, open_stopped, open_timed_out);
         }
 
         AVDictionaryEntry* unused = nullptr;
@@ -864,25 +1101,34 @@ public:
         av_dict_free(&options);
         if (!options_consumed) {
             Close();
-            return false;
+            return RecordOpenFailure(RtspFailureReason::kUnsupportedInput,
+                                     AVERROR(EINVAL), false);
         }
 
         ArmDeadline(interrupt_, timeout_us_);
         const int info_ret = avformat_find_stream_info(format_, nullptr);
+        const bool info_stopped = StopRequested();
+        const bool info_timed_out = DeadlineExpired();
         ArmDeadline(interrupt_, 0);
+        if (info_stopped && info_ret >= 0) {
+            Close();
+            return {RtspIoStatus::kInterrupted,
+                    RtspFailureReason::kStopRequested, AVERROR_EXIT};
+        }
         if (info_ret < 0) {
             LogError("[FFMPEG] avformat_find_stream_info failed: %s (%d)",
                      AvErrorText(info_ret).c_str(), info_ret);
             Close();
-            return false;
+            return ClassifyOpenFailure(info_ret, info_stopped, info_timed_out);
         }
 
         video_stream_index_ = av_find_best_stream(format_, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
         if (video_stream_index_ < 0) {
             LogError("[FFMPEG] av_find_best_stream found no video stream: %s (%d)",
                      AvErrorText(video_stream_index_).c_str(), video_stream_index_);
+            const int error = video_stream_index_;
             Close();
-            return false;
+            return RecordOpenFailure(RtspFailureReason::kUnsupportedInput, error, false);
         }
 
         stream_ = format_->streams[video_stream_index_];
@@ -891,13 +1137,15 @@ public:
             LogError("[FFMPEG] only H.264 is supported, codec_id=%d",
                      codec == nullptr ? -1 : static_cast<int>(codec->codec_id));
             Close();
-            return false;
+            return RecordOpenFailure(RtspFailureReason::kUnsupportedInput,
+                                     AVERROR_INVALIDDATA, false);
         }
         if (codec->width != kSourceWidth || codec->height != kSourceHeight) {
             LogError("[FFMPEG] source must be %dx%d, actual=%dx%d",
                      kSourceWidth, kSourceHeight, codec->width, codec->height);
             Close();
-            return false;
+            return RecordOpenFailure(RtspFailureReason::kUnsupportedInput,
+                                     AVERROR_INVALIDDATA, false);
         }
 
         const char* demuxer_name = format_->iformat == nullptr ? nullptr : format_->iformat->name;
@@ -905,7 +1153,8 @@ public:
             LogError("[FFMPEG] input is not handled by the RTSP demuxer: %s",
                      demuxer_name == nullptr ? "<null>" : demuxer_name);
             Close();
-            return false;
+            return RecordOpenFailure(RtspFailureReason::kUnsupportedInput,
+                                     AVERROR_INVALIDDATA, false);
         }
 
         packet_ = av_packet_alloc();
@@ -913,25 +1162,37 @@ public:
         if (packet_ == nullptr || filtered_packet_ == nullptr) {
             LogError("[FFMPEG] av_packet_alloc failed");
             Close();
-            return false;
+            return RecordOpenFailure(RtspFailureReason::kOutOfMemory, AVERROR(ENOMEM), false);
         }
 
         if (codec->extradata != nullptr && codec->extradata_size > 0) {
             const auto* extra = codec->extradata;
             const auto extra_size = static_cast<std::size_t>(codec->extradata_size);
             if (HasAnnexBPrefix(extra, extra_size)) {
+                const H264NalSummary extra_summary = InspectAnnexBNals(extra, extra_size);
+                if (!extra_summary.has_valid_nal || extra_summary.has_invalid_nal ||
+                    !extra_summary.has_sps || !extra_summary.has_pps) {
+                    LogError("[FFMPEG] Annex-B extradata has invalid or incomplete H.264 "
+                             "parameter sets");
+                    Close();
+                    return RecordOpenFailure(RtspFailureReason::kInvalidInput,
+                                             AVERROR_INVALIDDATA, false);
+                }
                 annex_b_parameter_sets_.assign(extra, extra + extra_size);
                 bitstream_mode_ = "annex-b (RTSP/SDP)";
             } else if (codec->extradata_size >= 7 && codec->extradata[0] == 1) {
-                if (!InitializeMp4ToAnnexB()) {
+                const int bsf_ret = InitializeMp4ToAnnexB();
+                if (bsf_ret < 0) {
                     Close();
-                    return false;
+                    return RecordOpenFailure(RtspFailureReason::kBitstreamFilter,
+                                             bsf_ret, false);
                 }
                 bitstream_mode_ = "avcC -> conditional h264_mp4toannexb";
             } else {
                 LogError("[FFMPEG] H.264 extradata is neither Annex-B nor valid avcC candidate");
                 Close();
-                return false;
+                return RecordOpenFailure(RtspFailureReason::kInvalidInput,
+                                         AVERROR_INVALIDDATA, false);
             }
         } else {
             bitstream_mode_ = "annex-b (no SDP parameter sets)";
@@ -944,26 +1205,34 @@ public:
                 stream_->time_base.den);
         LogInfo("[FFMPEG] bitstream mode: %s; explicit decoder APIs: disabled",
                 bitstream_mode_.c_str());
-        return true;
+        return {RtspIoStatus::kSuccess, RtspFailureReason::kNone, 0};
+    } catch (const std::bad_alloc&) {
+        LogError("[FFMPEG] memory allocation failed while opening RTSP input");
+        Close();
+        return RecordOpenFailure(RtspFailureReason::kOutOfMemory,
+                                 AVERROR(ENOMEM), false);
     }
 
-    ReadResult Read(AccessUnit* access_unit, std::int64_t timeout_us) {
+    RtspReadResult Read(AccessUnit* access_unit, std::int64_t timeout_us) try {
         if (access_unit == nullptr || format_ == nullptr || stream_ == nullptr) {
             LogError("[FFMPEG] Read called with invalid state: access_unit=%p format=%p stream=%p",
                      static_cast<void*>(access_unit), static_cast<void*>(format_),
                      static_cast<void*>(stream_));
-            return ReadResult::kError;
+            return RecordReadFailure(RtspFailureReason::kInvalidState,
+                                     AVERROR(EINVAL), false);
         }
         const std::int64_t deadline_us =
             timeout_us > 0 ? av_gettime_relative() + timeout_us : 0;
 
         while (true) {
-            if (interrupt_ != nullptr && interrupt_->stop_requested != nullptr &&
-                interrupt_->stop_requested->load(std::memory_order_relaxed)) {
-                return ReadResult::kInterrupted;
+            if (StopRequested()) {
+                return {RtspIoStatus::kInterrupted,
+                        RtspFailureReason::kStopRequested, AVERROR_EXIT};
             }
             if (deadline_us != 0 && av_gettime_relative() >= deadline_us) {
-                return ReadResult::kInterrupted;
+                LogError("[FFMPEG] RTSP read deadline expired");
+                return RecordReadFailure(RtspFailureReason::kTimeout,
+                                         FfmpegTimeoutError(), true);
             }
             AVPacket* output = nullptr;
             AVRational output_time_base = stream_->time_base;
@@ -975,29 +1244,20 @@ public:
                     output = filtered_packet_;
                     output_time_base = bsf_->time_base_out;
                 } else if (receive_ret == AVERROR_EOF) {
-                    return ReadResult::kEof;
+                    LogError("[FFMPEG] bitstream filter reached unexpected EOF");
+                    return RecordReadFailure(RtspFailureReason::kBitstreamFilter,
+                                             receive_ret, false);
                 } else if (receive_ret != AVERROR(EAGAIN)) {
-                    ++ffmpeg_errors_;
                     LogError("[FFMPEG] av_bsf_receive_packet failed: %s (%d)",
                              AvErrorText(receive_ret).c_str(), receive_ret);
-                    return ReadResult::kError;
+                    return RecordReadFailure(RtspFailureReason::kBitstreamFilter,
+                                             receive_ret, false);
                 }
             }
 
             if (output == nullptr) {
-                const ReadResult input_result = ReadSelectedPacket(deadline_us);
-                if (input_result != ReadResult::kPacket) {
-                    if (input_result == ReadResult::kEof && bsf_ != nullptr && !bsf_eof_sent_) {
-                        const int flush_ret = av_bsf_send_packet(bsf_, nullptr);
-                        if (flush_ret < 0 && flush_ret != AVERROR_EOF) {
-                            ++ffmpeg_errors_;
-                            LogError("[FFMPEG] flush BSF failed: %s (%d)",
-                                     AvErrorText(flush_ret).c_str(), flush_ret);
-                            return ReadResult::kError;
-                        }
-                        bsf_eof_sent_ = true;
-                        continue;
-                    }
+                const RtspReadResult input_result = ReadSelectedPacket(deadline_us);
+                if (input_result.status != RtspIoStatus::kSuccess) {
                     return input_result;
                 }
 
@@ -1006,25 +1266,37 @@ public:
                 } else {
                     const int send_ret = av_bsf_send_packet(bsf_, packet_);
                     if (send_ret < 0) {
-                        ++ffmpeg_errors_;
                         LogError("[FFMPEG] av_bsf_send_packet failed: %s (%d)",
                                  AvErrorText(send_ret).c_str(), send_ret);
                         av_packet_unref(packet_);
-                        return ReadResult::kError;
+                        return RecordReadFailure(RtspFailureReason::kBitstreamFilter,
+                                                 send_ret, false);
                     }
                     continue;
                 }
             }
 
-            const bool accepted = BuildAccessUnit(*output, output_time_base, access_unit);
+            const BuildAccessUnitResult build_result =
+                BuildAccessUnit(*output, output_time_base, access_unit);
             av_packet_unref(output);
-            if (accepted) {
-                return ReadResult::kPacket;
+            if (build_result == BuildAccessUnitResult::kAccepted) {
+                return {RtspIoStatus::kSuccess, RtspFailureReason::kNone, 0};
             }
-            if (fatal_packet_error_) {
-                return ReadResult::kError;
+            if (build_result == BuildAccessUnitResult::kFatal) {
+                return RecordReadFailure(RtspFailureReason::kInvalidPacket,
+                                         AVERROR_INVALIDDATA, false);
             }
         }
+    } catch (const std::bad_alloc&) {
+        if (packet_ != nullptr) {
+            av_packet_unref(packet_);
+        }
+        if (filtered_packet_ != nullptr) {
+            av_packet_unref(filtered_packet_);
+        }
+        LogError("[FFMPEG] memory allocation failed while building an access unit");
+        return RecordReadFailure(RtspFailureReason::kOutOfMemory,
+                                 AVERROR(ENOMEM), false);
     }
 
     void Close() {
@@ -1042,12 +1314,23 @@ public:
         }
         stream_ = nullptr;
         video_stream_index_ = -1;
-        bsf_eof_sent_ = false;
     }
 
     std::uint64_t input_packets() const { return input_packets_; }
     std::uint64_t skipped_before_idr() const { return skipped_before_idr_; }
     std::uint64_t ffmpeg_errors() const { return ffmpeg_errors_; }
+    std::uint64_t corrupt_packets() const { return corrupt_packets_; }
+    std::uint64_t recoverable_transport_errors() const {
+        return recoverable_transport_errors_;
+    }
+    std::uint64_t fatal_errors() const { return fatal_errors_; }
+    std::uint64_t pending_recovery_errors() const { return pending_recovery_errors_; }
+
+    std::uint64_t ConfirmRecoveredTransportErrors() {
+        const std::uint64_t confirmed = pending_recovery_errors_;
+        pending_recovery_errors_ = 0;
+        return confirmed;
+    }
 
     void RequestIdrResync() {
         waiting_for_idr_ = true;
@@ -1056,64 +1339,142 @@ public:
     }
 
 private:
-    bool InitializeMp4ToAnnexB() {
+    bool StopRequested() const {
+        return interrupt_ != nullptr && interrupt_->stop_requested != nullptr &&
+               interrupt_->stop_requested->load(std::memory_order_relaxed);
+    }
+
+    bool DeadlineExpired() const {
+        if (interrupt_ == nullptr) {
+            return false;
+        }
+        const std::int64_t deadline_us =
+            interrupt_->deadline_us.load(std::memory_order_relaxed);
+        return deadline_us != 0 && av_gettime_relative() >= deadline_us;
+    }
+
+    RtspOpenResult RecordOpenFailure(RtspFailureReason reason, int error,
+                                     bool recoverable) {
+        ++ffmpeg_errors_;
+        if (recoverable) {
+            ++recoverable_transport_errors_;
+            ++pending_recovery_errors_;
+            return {RtspIoStatus::kRecoverableFailure, reason, error};
+        }
+        ++fatal_errors_;
+        return {RtspIoStatus::kFatalFailure, reason, error};
+    }
+
+    RtspOpenResult ClassifyOpenFailure(int error, bool stopped, bool timed_out) {
+        if (stopped) {
+            return {RtspIoStatus::kInterrupted,
+                    RtspFailureReason::kStopRequested, error};
+        }
+        if (timed_out) {
+            return RecordOpenFailure(RtspFailureReason::kTimeout, error, true);
+        }
+        if (IsExplicitFatalFfmpegError(error)) {
+            return RecordOpenFailure(RtspFailureReason::kInvalidInput, error, false);
+        }
+        if (IsRecoverableRtspTransportError(error)) {
+            return RecordOpenFailure(RtspFailureReason::kNetworkIo, error, true);
+        }
+        return RecordOpenFailure(RtspFailureReason::kUnknown, error, false);
+    }
+
+    RtspReadResult RecordReadFailure(RtspFailureReason reason, int error,
+                                     bool recoverable) {
+        ++ffmpeg_errors_;
+        if (recoverable) {
+            ++recoverable_transport_errors_;
+            ++pending_recovery_errors_;
+            return {RtspIoStatus::kRecoverableFailure, reason, error};
+        }
+        ++fatal_errors_;
+        return {RtspIoStatus::kFatalFailure, reason, error};
+    }
+
+    int InitializeMp4ToAnnexB() {
         const AVBitStreamFilter* filter = av_bsf_get_by_name("h264_mp4toannexb");
         if (filter == nullptr) {
             LogError("[FFMPEG] bundled FFmpeg has no h264_mp4toannexb BSF");
-            return false;
+            return AVERROR(ENOENT);
         }
         int ret = av_bsf_alloc(filter, &bsf_);
         if (ret < 0) {
             LogError("[FFMPEG] av_bsf_alloc failed: %s (%d)", AvErrorText(ret).c_str(), ret);
-            return false;
+            return ret;
         }
         ret = avcodec_parameters_copy(bsf_->par_in, stream_->codecpar);
         if (ret < 0) {
             LogError("[FFMPEG] avcodec_parameters_copy failed: %s (%d)",
                      AvErrorText(ret).c_str(), ret);
-            return false;
+            return ret;
         }
         bsf_->time_base_in = stream_->time_base;
         ret = av_bsf_init(bsf_);
         if (ret < 0) {
             LogError("[FFMPEG] av_bsf_init failed: %s (%d)", AvErrorText(ret).c_str(), ret);
-            return false;
+            return ret;
         }
-        return true;
+        return 0;
     }
 
-    ReadResult ReadSelectedPacket(std::int64_t deadline_us) {
+    RtspReadResult ReadSelectedPacket(std::int64_t deadline_us) {
         while (true) {
-            if (interrupt_ != nullptr && interrupt_->stop_requested != nullptr &&
-                interrupt_->stop_requested->load(std::memory_order_relaxed)) {
-                return ReadResult::kInterrupted;
+            if (StopRequested()) {
+                return {RtspIoStatus::kInterrupted,
+                        RtspFailureReason::kStopRequested, AVERROR_EXIT};
             }
             if (deadline_us != 0 && av_gettime_relative() >= deadline_us) {
-                return ReadResult::kInterrupted;
+                LogError("[FFMPEG] RTSP read deadline expired");
+                return RecordReadFailure(RtspFailureReason::kTimeout,
+                                         FfmpegTimeoutError(), true);
             }
             av_packet_unref(packet_);
             if (interrupt_ != nullptr) {
                 interrupt_->deadline_us.store(deadline_us, std::memory_order_relaxed);
             }
             const int ret = av_read_frame(format_, packet_);
+            const bool stopped = StopRequested();
+            const bool timed_out = deadline_us != 0 && av_gettime_relative() >= deadline_us;
             ArmDeadline(interrupt_, 0);
-            if (ret == AVERROR_EOF) {
-                return ReadResult::kEof;
+            if (stopped) {
+                av_packet_unref(packet_);
+                return {RtspIoStatus::kInterrupted,
+                        RtspFailureReason::kStopRequested, ret};
             }
-            if (ret == AVERROR_EXIT ||
-                (interrupt_ != nullptr && interrupt_->stop_requested != nullptr &&
-                 interrupt_->stop_requested->load(std::memory_order_relaxed))) {
-                return ReadResult::kInterrupted;
+            if (ret == AVERROR_EOF) {
+                LogError("[FFMPEG] RTSP stream reached EOF");
+                return RecordReadFailure(RtspFailureReason::kEndOfStream, ret, true);
+            }
+            if (ret < 0 && timed_out) {
+                LogError("[FFMPEG] av_read_frame timed out: %s (%d)",
+                         AvErrorText(ret).c_str(), ret);
+                return RecordReadFailure(RtspFailureReason::kTimeout, ret, true);
+            }
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR(EINTR)) {
+                continue;
             }
             if (ret < 0) {
-                ++ffmpeg_errors_;
-                LogError("[FFMPEG] av_read_frame failed: %s (%d)", AvErrorText(ret).c_str(), ret);
-                return ReadResult::kError;
+                if (IsExplicitFatalFfmpegError(ret)) {
+                    LogError("[FFMPEG] av_read_frame fatal input/internal failure: %s (%d)",
+                             AvErrorText(ret).c_str(), ret);
+                    return RecordReadFailure(RtspFailureReason::kInvalidInput, ret, false);
+                }
+                if (IsRecoverableRtspTransportError(ret)) {
+                    LogError("[FFMPEG] av_read_frame recoverable transport failure: %s (%d)",
+                             AvErrorText(ret).c_str(), ret);
+                    return RecordReadFailure(RtspFailureReason::kNetworkIo, ret, true);
+                }
+                LogError("[FFMPEG] av_read_frame unclassified fatal failure: %s (%d)",
+                         AvErrorText(ret).c_str(), ret);
+                return RecordReadFailure(RtspFailureReason::kUnknown, ret, false);
             }
-            if (interrupt_ != nullptr && interrupt_->stop_requested != nullptr &&
-                interrupt_->stop_requested->load(std::memory_order_relaxed)) {
+            if (StopRequested()) {
                 av_packet_unref(packet_);
-                return ReadResult::kInterrupted;
+                return {RtspIoStatus::kInterrupted,
+                        RtspFailureReason::kStopRequested, AVERROR_EXIT};
             }
             if (packet_->stream_index != video_stream_index_) {
                 continue;
@@ -1121,47 +1482,49 @@ private:
             ++input_packets_;
             if ((packet_->flags & AV_PKT_FLAG_CORRUPT) != 0) {
                 ++ffmpeg_errors_;
+                ++corrupt_packets_;
                 waiting_for_idr_ = true;
                 pre_idr_parameter_sets_.clear();
                 LogWarning("[FFMPEG] discard packet marked corrupt, packet=%llu",
                            static_cast<unsigned long long>(input_packets_));
                 continue;
             }
-            return ReadResult::kPacket;
+            return {RtspIoStatus::kSuccess, RtspFailureReason::kNone, 0};
         }
     }
 
-    bool BuildAccessUnit(const AVPacket& packet, AVRational time_base, AccessUnit* access_unit) {
+    BuildAccessUnitResult BuildAccessUnit(const AVPacket& packet, AVRational time_base,
+                                          AccessUnit* access_unit) {
         if (packet.data == nullptr || packet.size <= 0 || access_unit == nullptr) {
-            ++ffmpeg_errors_;
             LogError("[FFMPEG] invalid demuxed packet: data=%p size=%d access_unit=%p",
                      static_cast<void*>(packet.data), packet.size, static_cast<void*>(access_unit));
-            return false;
+            return BuildAccessUnitResult::kFatal;
         }
         if (!HasAnnexBPrefix(packet.data, static_cast<std::size_t>(packet.size))) {
-            ++ffmpeg_errors_;
-            fatal_packet_error_ = true;
             LogError("[FFMPEG] demuxed H.264 packet is not Annex-B; refusing to guess packet format");
-            return false;
+            return BuildAccessUnitResult::kFatal;
         }
 
         const auto summary = InspectAnnexBNals(packet.data, static_cast<std::size_t>(packet.size));
+        if (!summary.has_valid_nal || summary.has_invalid_nal) {
+            LogError("[FFMPEG] demuxed Annex-B packet contains no valid H.264 NAL or has "
+                     "an invalid NAL header");
+            return BuildAccessUnitResult::kFatal;
+        }
 
         if (waiting_for_idr_ && !summary.has_idr) {
             if ((summary.has_sps || summary.has_pps) && !summary.has_vcl) {
                 constexpr std::size_t kMaxParameterSetBytes = 1024U * 1024U;
                 const auto packet_size = static_cast<std::size_t>(packet.size);
                 if (pre_idr_parameter_sets_.size() + packet_size > kMaxParameterSetBytes) {
-                    ++ffmpeg_errors_;
-                    fatal_packet_error_ = true;
                     LogError("[FFMPEG] pre-IDR SPS/PPS cache exceeds %zu bytes", kMaxParameterSetBytes);
-                    return false;
+                    return BuildAccessUnitResult::kFatal;
                 }
                 pre_idr_parameter_sets_.insert(pre_idr_parameter_sets_.end(),
                                                packet.data, packet.data + packet.size);
             }
             ++skipped_before_idr_;
-            return false;
+            return BuildAccessUnitResult::kSkipped;
         }
 
         const std::vector<std::uint8_t>* prefix = nullptr;
@@ -1218,7 +1581,7 @@ private:
             access_unit->pts_us = synthetic_pts_us_;
             synthetic_pts_us_ += duration_us;
         }
-        return true;
+        return BuildAccessUnitResult::kAccepted;
     }
 
     InterruptState* interrupt_{nullptr};
@@ -1235,11 +1598,13 @@ private:
     std::uint64_t input_packets_{0};
     std::uint64_t skipped_before_idr_{0};
     std::uint64_t ffmpeg_errors_{0};
+    std::uint64_t corrupt_packets_{0};
+    std::uint64_t recoverable_transport_errors_{0};
+    std::uint64_t fatal_errors_{0};
+    std::uint64_t pending_recovery_errors_{0};
     std::uint64_t synthetic_pts_us_{0};
     double reported_fps_{0.0};
     bool waiting_for_idr_{true};
-    bool bsf_eof_sent_{false};
-    bool fatal_packet_error_{false};
 };
 
 bool RecordCleanupResult(const char* api, AX_S32 result) {
@@ -1514,6 +1879,19 @@ enum class VdecDrainResult {
     kFatal,
 };
 
+enum class VdecOpenStatus {
+    kSuccess,
+    kTransientFailure,
+    kFatalFailure,
+};
+
+struct VdecOpenResult {
+    VdecOpenStatus status{VdecOpenStatus::kFatalFailure};
+    AX_S32 error_code{AX_SUCCESS};
+
+    bool successful() const { return status == VdecOpenStatus::kSuccess; }
+};
+
 struct VdecAccessUnitContext {
     std::uint64_t sequence{0};
     std::uint64_t pts_us{0};
@@ -1531,9 +1909,9 @@ public:
         (void)Close();
     }
 
-    bool Open(int width, int height, bool count_failure_as_fatal = true) {
+    VdecOpenResult Open(int width, int height) {
         if (!Close()) {
-            return false;
+            return {VdecOpenStatus::kFatalFailure, last_cleanup_error_code_};
         }
         ResetSessionStatistics();
         const AX_U32 aligned_width = AlignUp(static_cast<AX_U32>(width), 16);
@@ -1550,8 +1928,7 @@ public:
         if (const auto ret = AXCL_VDEC_CreateGrpEx(&group_, &group_attr); ret != AX_SUCCESS) {
             group_ = -1;
             LogError("[VDEC] AXCL_VDEC_CreateGrpEx failed: 0x%08X", static_cast<unsigned int>(ret));
-            RecordOpenFailure(count_failure_as_fatal, ret);
-            return false;
+            return FinishOpenFailure(ret, true);
         }
 
         AX_VDEC_GRP_PARAM_T group_param{};
@@ -1559,9 +1936,7 @@ public:
         group_param.stVdecVideoParam.enVdecMode = VIDEO_DEC_MODE_IPB;
         if (const auto ret = AXCL_VDEC_SetGrpParam(group_, &group_param); ret != AX_SUCCESS) {
             LogError("[VDEC] AXCL_VDEC_SetGrpParam failed: 0x%08X", static_cast<unsigned int>(ret));
-            RecordOpenFailure(count_failure_as_fatal, ret);
-            (void)Close();
-            return false;
+            return FinishOpenFailure(ret, true);
         }
 
         AX_VDEC_CHN_ATTR_T channel_attr{};
@@ -1578,45 +1953,35 @@ public:
             &channel_attr.stCompressInfo, PT_H264);
         if (channel_attr.u32FrameBufSize == 0) {
             LogError("[VDEC] AX_VDEC_GetPicBufferSize returned 0");
-            RecordOpenFailure(count_failure_as_fatal);
-            (void)Close();
-            return false;
+            return FinishOpenFailure(AX_SUCCESS, false);
         }
         if (const auto ret = AXCL_VDEC_SetChnAttr(group_, kVdecChannel, &channel_attr); ret != AX_SUCCESS) {
             LogError("[VDEC] AXCL_VDEC_SetChnAttr failed: 0x%08X", static_cast<unsigned int>(ret));
-            RecordOpenFailure(count_failure_as_fatal, ret);
-            (void)Close();
-            return false;
+            return FinishOpenFailure(ret, true);
         }
         if (const auto ret = AXCL_VDEC_EnableChn(group_, kVdecChannel); ret != AX_SUCCESS) {
             LogError("[VDEC] AXCL_VDEC_EnableChn failed: 0x%08X", static_cast<unsigned int>(ret));
-            RecordOpenFailure(count_failure_as_fatal, ret);
-            (void)Close();
-            return false;
+            return FinishOpenFailure(ret, true);
         }
         channel_enabled_ = true;
 
         if (const auto ret = AXCL_VDEC_SetDisplayMode(group_, AX_VDEC_DISPLAY_MODE_PLAYBACK);
             ret != AX_SUCCESS) {
             LogError("[VDEC] AXCL_VDEC_SetDisplayMode failed: 0x%08X", static_cast<unsigned int>(ret));
-            RecordOpenFailure(count_failure_as_fatal, ret);
-            (void)Close();
-            return false;
+            return FinishOpenFailure(ret, true);
         }
         AX_VDEC_RECV_PIC_PARAM_T receive_param{};
         receive_param.s32RecvPicNum = -1;
         if (const auto ret = AXCL_VDEC_StartRecvStream(group_, &receive_param); ret != AX_SUCCESS) {
             LogError("[VDEC] AXCL_VDEC_StartRecvStream failed: 0x%08X", static_cast<unsigned int>(ret));
-            RecordOpenFailure(count_failure_as_fatal, ret);
-            (void)Close();
-            return false;
+            return FinishOpenFailure(ret, true);
         }
         started_ = true;
         LogInfo("[VDEC] group=%d input_mode=FRAME output=NV12 original=%dx%d stride=%u buffers=%u "
                 "send_wait_ms=%d slow_send_ms=%.1f",
                 group_, width, height, channel_attr.u32FrameStride, channel_attr.u32FrameBufCnt,
                 kAxWaitMs, kSlowVdecSendMilliseconds);
-        return true;
+        return {VdecOpenStatus::kSuccess, AX_SUCCESS};
     }
 
     VdecSendResult Send(const AccessUnit& access_unit, const FrameHandler& handler,
@@ -1667,31 +2032,31 @@ public:
                                                  decoded_any);
             }
             if (!IsBufferPressure(call.result)) {
-                bool recoverable_stream_error = call.result == AX_ERR_VDEC_STRM_ERROR;
+                const bool recoverable_stream_error =
+                    call.result == AX_ERR_VDEC_STRM_ERROR;
                 const std::uint64_t failure_event_id =
                     RecordSendFailure(call, stream, "data", access_unit_sequence, retry_index);
                 AX_VDEC_GRP_STATUS_T status{};
                 const bool status_available =
                     QueryFailureStatusSnapshot(failure_event_id, &status);
-                recoverable_stream_error =
-                    recoverable_stream_error ||
-                    (status_available && session_hardware_decode_errors_ != 0);
+                if (!status_available) {
+                    ++statistics_.errors;
+                    LogError("[VDEC] failure status unavailable: event=%llu "
+                             "classification=fatal",
+                             static_cast<unsigned long long>(failure_event_id));
+                    return VdecSendResult::kFatal;
+                }
                 if (recoverable_stream_error) {
                     ++statistics_.stream_errors;
-                    if (call.result != AX_ERR_VDEC_STRM_ERROR) {
-                        LogError("[VDEC] SendStream failure exposed recoverable hardware decode "
-                                 "fault: event=%llu original_ret=0x%08X current_hw_errors=%llu",
-                                 static_cast<unsigned long long>(failure_event_id),
-                                 static_cast<unsigned int>(call.result),
-                                 static_cast<unsigned long long>(
-                                     session_hardware_decode_errors_));
-                    }
-                    if (!status_available) {
-                        LogError("[VDEC][FAULT_STATUS] event=%llu status_unavailable=1; "
-                                 "single-camera recovery will still be attempted",
-                                 static_cast<unsigned long long>(failure_event_id));
-                    }
                     return VdecSendResult::kRecoverableStreamError;
+                }
+                if (status_available && session_hardware_decode_errors_ != 0) {
+                    LogError("[VDEC] unclassified decode diagnostics remain fatal: event=%llu "
+                             "original_ret=0x%08X current_hw_errors=%llu",
+                             static_cast<unsigned long long>(failure_event_id),
+                             static_cast<unsigned int>(call.result),
+                             static_cast<unsigned long long>(
+                                 session_hardware_decode_errors_));
                 }
                 ++statistics_.errors;
                 return VdecSendResult::kFatal;
@@ -1773,6 +2138,7 @@ public:
     }
 
     bool Close() {
+        last_cleanup_error_code_ = AX_SUCCESS;
         bool successful = true;
         if (group_ >= 0 && started_) {
             const bool stop_successful = RecordVdecCleanupResult(
@@ -1802,7 +2168,6 @@ public:
                 started_ = false;
             }
         }
-        last_cleanup_successful_ = successful;
         if (!successful) {
             ++statistics_.errors;
         }
@@ -1812,12 +2177,11 @@ public:
     const VdecStatistics& statistics() const { return statistics_; }
     bool is_open() const { return group_ >= 0 && started_; }
     AX_VDEC_GRP group() const { return group_; }
-    bool last_cleanup_successful() const { return last_cleanup_successful_; }
     std::uint64_t current_hardware_decode_errors() const {
         return session_hardware_decode_errors_;
     }
 
-    bool RefreshStatus(bool record_recoverable_hardware_fault = false) {
+    bool RefreshStatus(bool record_decode_diagnostic = false) {
         if (group_ < 0) {
             return false;
         }
@@ -1833,9 +2197,9 @@ public:
         }
         const std::uint64_t previous_session_errors = session_hardware_decode_errors_;
         UpdateStatusStatistics(status);
-        if (record_recoverable_hardware_fault && previous_session_errors == 0 &&
+        if (record_decode_diagnostic && previous_session_errors == 0 &&
             session_hardware_decode_errors_ != 0) {
-            RecordStatusHardwareFault(status, query_ms);
+            RecordStatusFatalFault(status, query_ms);
         }
         return true;
     }
@@ -1894,17 +2258,27 @@ private:
         return causes.empty() ? "not-reported" : causes;
     }
 
-    void RecordOpenFailure(bool count_failure_as_fatal, AX_S32 result = AX_SUCCESS) {
+    VdecOpenResult FinishOpenFailure(AX_S32 result, bool transient_allowed) {
         if (result != AX_SUCCESS) {
             statistics_.last_error_code = static_cast<std::uint32_t>(result);
         }
-        if (count_failure_as_fatal) {
+        const bool transient = transient_allowed && result == AX_ERR_VDEC_STRM_ERROR;
+        if (!transient) {
             ++statistics_.errors;
         }
+        if (!Close()) {
+            return {VdecOpenStatus::kFatalFailure, last_cleanup_error_code_};
+        }
+        return {transient ? VdecOpenStatus::kTransientFailure
+                          : VdecOpenStatus::kFatalFailure,
+                result};
     }
 
     bool RecordVdecCleanupResult(const char* api, AX_S32 result) {
         if (result != AX_SUCCESS) {
+            if (last_cleanup_error_code_ == AX_SUCCESS) {
+                last_cleanup_error_code_ = result;
+            }
             statistics_.last_error_code = static_cast<std::uint32_t>(result);
         }
         return RecordCleanupResult(api, result);
@@ -1918,7 +2292,6 @@ private:
         statistics_.consecutive_task_timeouts = 0;
         statistics_.left_stream_frames = 0;
         statistics_.left_output_frames = 0;
-        last_cleanup_successful_ = true;
     }
 
     void LogFaultStatus(std::uint64_t failure_event_id, double query_ms,
@@ -1941,15 +2314,13 @@ private:
                      error.s32VdecStreamNotRelease);
     }
 
-    void RecordStatusHardwareFault(const AX_VDEC_GRP_STATUS_T& status, double query_ms) {
+    void RecordStatusFatalFault(const AX_VDEC_GRP_STATUS_T& status, double query_ms) {
         const std::uint64_t failure_event_id = ++statistics_.failure_events;
-        ++statistics_.stream_errors;
-        statistics_.last_error_code = static_cast<std::uint32_t>(AX_ERR_VDEC_STRM_ERROR);
-        LogError("[VDEC] status reported recoverable hardware decode fault: event=%llu "
-                 "ret=0x%08X current_hw_errors=%llu last_au_seq=%llu pts=%llu bytes=%zu "
+        ++statistics_.errors;
+        LogError("[VDEC] status reported unclassified decode diagnostics: event=%llu "
+                 "classification=fatal current_hw_errors=%llu last_au_seq=%llu pts=%llu bytes=%zu "
                  "nals[sps=%d pps=%d idr=%d vcl=%d]",
                  static_cast<unsigned long long>(failure_event_id),
-                 static_cast<unsigned int>(AX_ERR_VDEC_STRM_ERROR),
                  static_cast<unsigned long long>(session_hardware_decode_errors_),
                  static_cast<unsigned long long>(last_submitted_access_unit_.sequence),
                  static_cast<unsigned long long>(last_submitted_access_unit_.pts_us),
@@ -2078,12 +2449,12 @@ private:
 
         if (session_hardware_decode_errors_ != 0) {
             ++statistics_.unrecovered_task_timeouts;
-            ++statistics_.stream_errors;
-            LogError("[VDEC] task timeout exposed recoverable hardware decode fault: event=%llu "
-                     "current_hw_errors=%llu",
+            ++statistics_.errors;
+            LogError("[VDEC] task timeout exposed unclassified decode diagnostics: event=%llu "
+                     "current_hw_errors=%llu classification=fatal",
                      static_cast<unsigned long long>(failure_event_id),
                      static_cast<unsigned long long>(session_hardware_decode_errors_));
-            return VdecSendResult::kRecoverableStreamError;
+            return VdecSendResult::kFatal;
         }
 
         const bool healthy = status.bStartRecvStream != AX_FALSE &&
@@ -2165,8 +2536,7 @@ private:
         const bool status_available =
             QueryFailureStatusSnapshot(failure_event_id, &status);
         const bool recoverable_stream_error =
-            result == AX_ERR_VDEC_STRM_ERROR ||
-            (status_available && session_hardware_decode_errors_ != 0);
+            status_available && result == AX_ERR_VDEC_STRM_ERROR;
         if (recoverable_stream_error) {
             ++statistics_.stream_errors;
         } else {
@@ -2195,14 +2565,9 @@ private:
                  static_cast<unsigned long long>(statistics_.decoded_frames));
 
         if (!status_available) {
-            if (recoverable_stream_error) {
-                LogError("[VDEC][FAULT_STATUS] event=%llu status_unavailable=1; "
-                         "single-camera recovery will still be attempted",
-                         static_cast<unsigned long long>(failure_event_id));
-            } else {
-                LogError("[VDEC][FAULT_STATUS] event=%llu status_unavailable=1",
-                         static_cast<unsigned long long>(failure_event_id));
-            }
+            LogError("[VDEC][FAULT_STATUS] event=%llu status_unavailable=1 "
+                     "classification=fatal",
+                     static_cast<unsigned long long>(failure_event_id));
         }
         return recoverable_stream_error ? VdecDrainResult::kRecoverableStreamError
                                         : VdecDrainResult::kFatal;
@@ -2274,7 +2639,7 @@ private:
     const std::atomic<bool>* stop_requested_{nullptr};
     bool channel_enabled_{false};
     bool started_{false};
-    bool last_cleanup_successful_{true};
+    AX_S32 last_cleanup_error_code_{AX_SUCCESS};
     std::uint64_t session_sent_access_units_{0};
     std::uint64_t session_hardware_decode_errors_{0};
     VdecAccessUnitContext last_submitted_access_unit_{};
@@ -2650,6 +3015,10 @@ struct RouteSnapshot {
     std::uint64_t input_packets{0};
     std::uint64_t skipped_before_idr{0};
     std::uint64_t ffmpeg_errors{0};
+    std::uint64_t corrupt_packets{0};
+    std::uint64_t recoverable_rtsp_errors{0};
+    std::uint64_t fatal_ffmpeg_errors{0};
+    std::uint64_t pending_recovery_errors{0};
     VdecStatistics vdec{};
     IvpsStatistics ivps{};
     std::uint64_t rate_skips{0};
@@ -2685,6 +3054,10 @@ public:
         next.input_packets = demuxer.input_packets();
         next.skipped_before_idr = demuxer.skipped_before_idr();
         next.ffmpeg_errors = demuxer.ffmpeg_errors();
+        next.corrupt_packets = demuxer.corrupt_packets();
+        next.recoverable_rtsp_errors = demuxer.recoverable_transport_errors();
+        next.fatal_ffmpeg_errors = demuxer.fatal_errors();
+        next.pending_recovery_errors = demuxer.pending_recovery_errors();
         next.vdec = vdec.statistics();
         next.ivps = ivps.statistics();
         next.rate_skips = rate_skips;
@@ -2725,7 +3098,6 @@ public:
     std::uint64_t recovery_successes{0};
     std::uint64_t recovery_failures{0};
     std::uint64_t recovered_ffmpeg_errors{0};
-    std::uint64_t recovery_ffmpeg_error_baseline{0};
     double completed_recovery_downtime_ms{0.0};
     Clock::time_point recovery_started{};
     bool raw_dump_written{false};
@@ -2836,12 +3208,6 @@ double CounterDelta(double current, double previous) {
     return current >= previous ? current - previous : current;
 }
 
-std::uint64_t UnrecoveredFfmpegErrors(const RouteSnapshot& snapshot) {
-    return snapshot.ffmpeg_errors >= snapshot.recovered_ffmpeg_errors
-               ? snapshot.ffmpeg_errors - snapshot.recovered_ffmpeg_errors
-               : snapshot.ffmpeg_errors;
-}
-
 void UpdateInferenceRateMonitor(std::size_t camera_id, Clock::time_point started,
                                 Clock::time_point now, std::uint64_t inferred,
                                 StatisticsTracker* tracker) {
@@ -2924,11 +3290,23 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
     bool route_failed = false;
     bool recovering = false;
     bool session_open = false;
-    std::size_t recovery_backoff_index = 0;
+    std::uint32_t recovery_attempts_used = 0;
+    Clock::time_point recovery_stable_deadline{};
 
     try {
-        if (!thread_context.Open(runtime_device_id) ||
-            !route->demuxer.Open(options->source, options->read_timeout_ms)) {
+        if (!thread_context.Open(runtime_device_id)) {
+            route->PublishSnapshot(CameraRunState::kFailed);
+            startup_gate->Report(false);
+            startup_reported = true;
+            return;
+        }
+        const RtspOpenResult initial_rtsp_open =
+            route->demuxer.Open(options->source, options->read_timeout_ms);
+        if (!initial_rtsp_open.successful()) {
+            LogError("[FFMPEG] initial RTSP open failed: classification=%s error=%d; "
+                     "startup retries are disabled",
+                     RtspFailureReasonName(initial_rtsp_open.reason),
+                     initial_rtsp_open.error_code);
             route->PublishSnapshot(CameraRunState::kFailed);
             startup_gate->Report(false);
             startup_reported = true;
@@ -3010,76 +3388,161 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
             return true;
         };
 
-        const auto advance_recovery_backoff = [&] {
-            recovery_backoff_index =
-                std::min(recovery_backoff_index + 1, kCameraRecoveryBackoff.size() - 1);
+        const auto remaining_recovery_budget = [&] {
+            return kCameraRecoveryMaxAttempts - recovery_attempts_used;
         };
 
-        const auto start_or_restart_recovery = [&](const char* reason) {
-            if (recovering) {
+        const auto reset_stable_budget_if_due = [&] {
+            const auto now = Clock::now();
+            if (recovering || recovery_stable_deadline == Clock::time_point{} ||
+                now < recovery_stable_deadline) {
+                return;
+            }
+            const std::uint32_t completed_attempts = recovery_attempts_used;
+            recovery_attempts_used = 0;
+            recovery_stable_deadline = Clock::time_point{};
+            LogInfo("[RECOVERY] stable window completed: camera=%zu "
+                    "classification=stable-window-complete attempt=%u remaining=%u "
+                    "stable_s=%lld budget_reset=%u",
+                    route->camera_id, completed_attempts, kCameraRecoveryMaxAttempts,
+                    static_cast<long long>(kCameraRecoveryStableWindow.count()),
+                    kCameraRecoveryMaxAttempts);
+        };
+
+        const auto record_attempt_failure =
+            [&](const char* classification, const char* reason,
+                long long error_code) {
+                if (recovery_attempts_used == 0) {
+                    LogError("[RECOVERY] invalid attempt state: camera=%zu "
+                             "classification=%s reason=%s",
+                             route->camera_id, classification, reason);
+                    route_failed = true;
+                    route->PublishSnapshot(CameraRunState::kFailed);
+                    return false;
+                }
                 ++route->recovery_failures;
-                advance_recovery_backoff();
-            } else {
+                LogError("[RECOVERY] attempt failed: camera=%zu classification=%s reason=%s "
+                         "attempt=%u remaining=%u error=%lld",
+                         route->camera_id, classification, reason,
+                         recovery_attempts_used, remaining_recovery_budget(), error_code);
+                if (recovery_attempts_used < kCameraRecoveryMaxAttempts) {
+                    return true;
+                }
+                LogError("[RECOVERY] budget exhausted: camera=%zu classification=%s "
+                         "attempt=%u remaining=0 action=global-coordinated-shutdown",
+                         route->camera_id, classification, recovery_attempts_used);
+                InvalidateLatestFrameSlot(route);
+                route->PublishSnapshot(CameraRunState::kFailed);
+                route_failed = true;
+                return false;
+            };
+
+        const auto start_or_restart_recovery =
+            [&](const char* classification, const char* reason,
+                long long error_code) {
+                reset_stable_budget_if_due();
+                const bool current_attempt_failed =
+                    recovering || recovery_stable_deadline != Clock::time_point{};
+                if (current_attempt_failed &&
+                    !record_attempt_failure(classification, reason, error_code)) {
+                    return false;
+                }
+
+                if (route->recovery_started == Clock::time_point{}) {
+                    route->recovery_started = Clock::now();
+                }
                 recovering = true;
-                route->recovery_started = Clock::now();
-                route->recovery_ffmpeg_error_baseline = route->demuxer.ffmpeg_errors();
-            }
+                recovery_stable_deadline = Clock::time_point{};
 
-            const AX_VDEC_GRP old_group = route->vdec.group();
-            const VdecStatistics fault_statistics = route->vdec.statistics();
-            LogError("[RECOVERY] camera-local recovery triggered: reason=%s old_group=%d "
-                     "last_error_code=0x%08X stream_errors=%llu current_hw_errors=%llu",
-                     reason, old_group,
-                     static_cast<unsigned int>(fault_statistics.last_error_code),
-                     static_cast<unsigned long long>(fault_statistics.stream_errors),
-                     static_cast<unsigned long long>(
-                         fault_statistics.current_hardware_decode_errors));
+                const AX_VDEC_GRP old_group = route->vdec.group();
+                const VdecStatistics fault_statistics = route->vdec.statistics();
+                LogError("[RECOVERY] camera-local recovery triggered: camera=%zu "
+                         "classification=%s reason=%s error=%lld next_attempt=%u remaining=%u "
+                         "old_group=%d last_vdec_error=0x%08X stream_errors=%llu",
+                         route->camera_id, classification, reason, error_code,
+                         recovery_attempts_used + 1U, remaining_recovery_budget(), old_group,
+                         static_cast<unsigned int>(fault_statistics.last_error_code),
+                         static_cast<unsigned long long>(fault_statistics.stream_errors));
 
-            InvalidateLatestFrameSlot(route);
-            route->PublishSnapshot(CameraRunState::kReconnecting);
-            route->interrupt.deadline_us.store(0, std::memory_order_relaxed);
+                InvalidateLatestFrameSlot(route);
+                route->PublishSnapshot(CameraRunState::kReconnecting);
+                route->interrupt.deadline_us.store(0, std::memory_order_relaxed);
 
-            if (!thread_context.Bind()) {
-                LogError("[RECOVERY] worker context bind failed; escalating to global failure");
-                return false;
-            }
-            const bool vdec_closed = route->vdec.Close();
-            route->demuxer.Close();
-            session_open = false;
-            if (!vdec_closed) {
-                LogError("[RECOVERY] old VDEC group cleanup failed: group=%d; "
-                         "escalating to global failure",
-                         old_group);
-                return false;
-            }
-            LogInfo("[RECOVERY] old camera session closed: group=%d", old_group);
-            return true;
-        };
+                if (!session_open) {
+                    LogError("[RECOVERY] camera session is unexpectedly closed; "
+                             "classification=fatal-internal-state");
+                    return false;
+                }
+                if (!thread_context.Bind()) {
+                    LogError("[RECOVERY] worker context bind failed; escalating to global failure");
+                    return false;
+                }
+                const bool vdec_closed = route->vdec.Close();
+                route->demuxer.Close();
+                session_open = false;
+                if (!vdec_closed) {
+                    LogError("[RECOVERY] old VDEC group cleanup failed: group=%d; "
+                             "escalating to global failure",
+                             old_group);
+                    return false;
+                }
+                LogInfo("[RECOVERY] old camera session closed: camera=%zu group=%d "
+                        "next_attempt=%u remaining=%u",
+                        route->camera_id, old_group, recovery_attempts_used + 1U,
+                        remaining_recovery_budget());
+                return true;
+            };
 
         while (!stop_requested->load(std::memory_order_relaxed)) {
+            reset_stable_budget_if_due();
             if (recovering && !session_open) {
-                const auto delay = kCameraRecoveryBackoff[recovery_backoff_index];
-                LogWarning("[RECOVERY] retry scheduled: attempt=%llu backoff_s=%lld",
-                           static_cast<unsigned long long>(route->recovery_attempts + 1),
-                           static_cast<long long>(delay.count()));
                 route->PublishSnapshot(CameraRunState::kReconnecting);
-                if (!WaitForCameraRecovery(stop_requested, delay)) {
-                    break;
-                }
-                if (stop_requested->load(std::memory_order_relaxed)) {
-                    break;
+                if (recovery_attempts_used != 0) {
+                    LogWarning("[RECOVERY] retry scheduled: camera=%zu attempt=%u "
+                               "remaining=%u delay_s=%lld",
+                               route->camera_id, recovery_attempts_used + 1U,
+                               remaining_recovery_budget(),
+                               static_cast<long long>(kCameraRecoveryRetryDelay.count()));
+                    if (!WaitForCameraRecovery(stop_requested,
+                                               kCameraRecoveryRetryDelay)) {
+                        break;
+                    }
+                    if (stop_requested->load(std::memory_order_relaxed)) {
+                        break;
+                    }
                 }
 
+                ++recovery_attempts_used;
                 ++route->recovery_attempts;
                 const auto attempt_started = Clock::now();
-                if (!route->demuxer.Open(options->source, options->read_timeout_ms)) {
-                    ++route->recovery_failures;
-                    advance_recovery_backoff();
-                    LogError("[RECOVERY] RTSP reopen failed: attempt=%llu elapsed_ms=%.3f",
-                             static_cast<unsigned long long>(route->recovery_attempts),
-                             ElapsedMilliseconds(attempt_started));
+                LogWarning("[RECOVERY] attempt started: camera=%zu classification=session-rebuild "
+                           "attempt=%u remaining=%u lifetime_attempts=%llu",
+                           route->camera_id, recovery_attempts_used,
+                           remaining_recovery_budget(),
+                           static_cast<unsigned long long>(route->recovery_attempts));
+                const RtspOpenResult rtsp_open =
+                    route->demuxer.Open(options->source, options->read_timeout_ms);
+                if (rtsp_open.status == RtspIoStatus::kInterrupted &&
+                    stop_requested->load(std::memory_order_relaxed)) {
+                    break;
+                }
+                if (rtsp_open.status == RtspIoStatus::kRecoverableFailure) {
+                    if (!record_attempt_failure(
+                            "rtsp-transport", RtspFailureReasonName(rtsp_open.reason),
+                            rtsp_open.error_code)) {
+                        break;
+                    }
                     route->PublishSnapshot(CameraRunState::kReconnecting);
                     continue;
+                }
+                if (!rtsp_open.successful()) {
+                    LogError("[RECOVERY] RTSP reopen is fatal: camera=%zu classification=%s "
+                             "attempt=%u remaining=%u error=%d elapsed_ms=%.3f",
+                             route->camera_id, RtspFailureReasonName(rtsp_open.reason),
+                             recovery_attempts_used, remaining_recovery_budget(),
+                             rtsp_open.error_code, ElapsedMilliseconds(attempt_started));
+                    route_failed = true;
+                    break;
                 }
                 if (!thread_context.Bind()) {
                     route->demuxer.Close();
@@ -3088,76 +3551,69 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
                     route_failed = true;
                     break;
                 }
-                if (!route->vdec.Open(kSourceWidth, kSourceHeight, false)) {
-                    ++route->recovery_failures;
-                    advance_recovery_backoff();
-                    const bool cleanup_successful = route->vdec.last_cleanup_successful();
+                const VdecOpenResult vdec_open =
+                    route->vdec.Open(kSourceWidth, kSourceHeight);
+                if (vdec_open.status == VdecOpenStatus::kTransientFailure) {
                     route->demuxer.Close();
-                    LogError("[RECOVERY] VDEC reopen failed: attempt=%llu elapsed_ms=%.3f "
-                             "cleanup_successful=%d",
-                             static_cast<unsigned long long>(route->recovery_attempts),
-                             ElapsedMilliseconds(attempt_started), cleanup_successful ? 1 : 0);
-                    route->PublishSnapshot(CameraRunState::kReconnecting);
-                    if (!cleanup_successful) {
-                        LogError("[RECOVERY] partial VDEC cleanup failed; "
-                                 "escalating to global failure");
-                        route_failed = true;
+                    if (!record_attempt_failure("vdec-transient-open",
+                                                "confirmed-vdec-stream-error",
+                                                vdec_open.error_code)) {
                         break;
                     }
+                    route->PublishSnapshot(CameraRunState::kReconnecting);
                     continue;
+                }
+                if (!vdec_open.successful()) {
+                    route->demuxer.Close();
+                    LogError("[RECOVERY] VDEC reopen is fatal: camera=%zu attempt=%u "
+                             "remaining=%u error=0x%08X elapsed_ms=%.3f",
+                             route->camera_id, recovery_attempts_used,
+                             remaining_recovery_budget(),
+                             static_cast<unsigned int>(vdec_open.error_code),
+                             ElapsedMilliseconds(attempt_started));
+                    route_failed = true;
+                    break;
                 }
 
                 session_open = true;
                 next_status_refresh = Clock::now() + std::chrono::seconds(1);
-                LogInfo("[RECOVERY] camera session reopened: attempt=%llu new_group=%d "
-                        "elapsed_ms=%.3f state=waiting-for-idr-and-first-frame",
-                        static_cast<unsigned long long>(route->recovery_attempts),
-                        route->vdec.group(), ElapsedMilliseconds(attempt_started));
+                LogInfo("[RECOVERY] camera session reopened: camera=%zu attempt=%u "
+                        "remaining=%u new_group=%d elapsed_ms=%.3f "
+                        "state=waiting-for-idr-and-first-healthy-frame",
+                        route->camera_id, recovery_attempts_used,
+                        remaining_recovery_budget(), route->vdec.group(),
+                        ElapsedMilliseconds(attempt_started));
                 route->PublishSnapshot(CameraRunState::kReconnecting);
             }
 
             AccessUnit access_unit;
             const auto read_timeout_us =
                 static_cast<std::int64_t>(options->read_timeout_ms) * 1000;
-            const ReadResult read_result = route->demuxer.Read(&access_unit, read_timeout_us);
-            if (read_result == ReadResult::kInterrupted) {
+            const RtspReadResult read_result =
+                route->demuxer.Read(&access_unit, read_timeout_us);
+            if (read_result.status == RtspIoStatus::kInterrupted) {
                 if (stop_requested->load(std::memory_order_relaxed)) {
                     break;
                 }
-                if (recovering) {
-                    LogError("[RECOVERY] reopened RTSP read interrupted by timeout");
-                    if (!start_or_restart_recovery("recovery-rtsp-read-timeout")) {
-                        route_failed = true;
-                        break;
-                    }
-                    continue;
-                }
-                LogError("[FFMPEG] RTSP read interrupted by timeout");
+                LogError("[FFMPEG] RTSP read was interrupted without a stop request; "
+                         "classification=fatal-internal-state");
                 route_failed = true;
                 break;
             }
-            if (read_result == ReadResult::kEof) {
-                if (recovering) {
-                    LogError("[RECOVERY] reopened RTSP stream ended before first decoded frame");
-                    if (!start_or_restart_recovery("recovery-rtsp-eof")) {
-                        route_failed = true;
-                        break;
-                    }
-                    continue;
+            if (read_result.status == RtspIoStatus::kRecoverableFailure) {
+                if (!start_or_restart_recovery(
+                        "rtsp-transport", RtspFailureReasonName(read_result.reason),
+                        read_result.error_code)) {
+                    route_failed = true;
+                    break;
                 }
-                LogError("[FFMPEG] RTSP stream ended; recovery is limited to VDEC stream faults");
-                route_failed = true;
-                break;
+                continue;
             }
-            if (read_result == ReadResult::kError) {
-                if (recovering) {
-                    LogError("[RECOVERY] reopened RTSP read failed before first decoded frame");
-                    if (!start_or_restart_recovery("recovery-rtsp-read-error")) {
-                        route_failed = true;
-                        break;
-                    }
-                    continue;
-                }
+            if (read_result.status == RtspIoStatus::kFatalFailure) {
+                LogError("[FFMPEG] fatal RTSP/input failure: camera=%zu classification=%s "
+                         "error=%d",
+                         route->camera_id, RtspFailureReasonName(read_result.reason),
+                         read_result.error_code);
                 route_failed = true;
                 break;
             }
@@ -3169,7 +3625,10 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
                 if (stop_requested->load(std::memory_order_relaxed)) {
                     break;
                 }
-                if (!start_or_restart_recovery("vdec-stream-error")) {
+                const auto vdec_error = static_cast<long long>(
+                    static_cast<std::int32_t>(route->vdec.statistics().last_error_code));
+                if (!start_or_restart_recovery(
+                        "vdec-stream", "confirmed-vdec-stream-error", vdec_error)) {
                     route_failed = true;
                     break;
                 }
@@ -3194,30 +3653,35 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
                     break;
                 }
                 if (route->vdec.current_hardware_decode_errors() != 0) {
-                    if (!start_or_restart_recovery(
-                            "vdec-hardware-decode-error-before-first-healthy-frame")) {
-                        route_failed = true;
-                        break;
-                    }
-                    continue;
+                    LogError("[RECOVERY] first decoded frame is not healthy: camera=%zu "
+                             "classification=fatal-unclassified-vdec-status attempt=%u "
+                             "current_hw_errors=%llu",
+                             route->camera_id, recovery_attempts_used,
+                             static_cast<unsigned long long>(
+                                 route->vdec.current_hardware_decode_errors()));
+                    route_failed = true;
+                    break;
                 }
+                const auto healthy_at = Clock::now();
                 const double downtime_ms = ElapsedMilliseconds(route->recovery_started);
-                const std::uint64_t current_ffmpeg_errors = route->demuxer.ffmpeg_errors();
-                if (current_ffmpeg_errors >= route->recovery_ffmpeg_error_baseline) {
-                    route->recovered_ffmpeg_errors +=
-                        current_ffmpeg_errors - route->recovery_ffmpeg_error_baseline;
-                }
+                const std::uint64_t confirmed_rtsp_errors =
+                    route->demuxer.ConfirmRecoveredTransportErrors();
+                route->recovered_ffmpeg_errors += confirmed_rtsp_errors;
                 route->completed_recovery_downtime_ms += downtime_ms;
                 route->recovery_started = Clock::time_point{};
                 ++route->recovery_successes;
                 recovering = false;
-                recovery_backoff_index = 0;
-                next_status_refresh = Clock::now() + std::chrono::seconds(1);
-                LogInfo("[RECOVERY] camera recovered after first decoded frame: group=%d "
-                        "attempts=%llu successes=%llu downtime_ms=%.3f",
-                        route->vdec.group(),
-                        static_cast<unsigned long long>(route->recovery_attempts),
-                        static_cast<unsigned long long>(route->recovery_successes), downtime_ms);
+                recovery_stable_deadline = healthy_at + kCameraRecoveryStableWindow;
+                next_status_refresh = healthy_at + std::chrono::seconds(1);
+                LogInfo("[RECOVERY] first healthy frame: camera=%zu classification=healthy "
+                        "attempt=%u remaining=%u group=%d recovered_rtsp_errors=%llu "
+                        "successes=%llu downtime_ms=%.3f stable_s=%lld state=running",
+                        route->camera_id, recovery_attempts_used,
+                        remaining_recovery_budget(), route->vdec.group(),
+                        static_cast<unsigned long long>(confirmed_rtsp_errors),
+                        static_cast<unsigned long long>(route->recovery_successes),
+                        downtime_ms,
+                        static_cast<long long>(kCameraRecoveryStableWindow.count()));
             }
             if (Clock::now() >= next_status_refresh) {
                 if (!route->vdec.RefreshStatus(true)) {
@@ -3225,11 +3689,13 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
                     break;
                 }
                 if (route->vdec.current_hardware_decode_errors() != 0) {
-                    if (!start_or_restart_recovery("vdec-hardware-decode-error")) {
-                        route_failed = true;
-                        break;
-                    }
-                    continue;
+                    LogError("[VDEC] unclassified status diagnostics are fatal: camera=%zu "
+                             "current_hw_errors=%llu",
+                             route->camera_id,
+                             static_cast<unsigned long long>(
+                                 route->vdec.current_hardware_decode_errors()));
+                    route_failed = true;
+                    break;
                 }
                 next_status_refresh = Clock::now() + std::chrono::seconds(1);
             }
@@ -3455,10 +3921,8 @@ void PrintMultiStatistics(const Options& options, Clock::time_point started,
         final_console_cameras += final_console_camera_text;
         total_decoded_fps += decoded_fps;
         total_inference_fps += infer_fps;
-        const std::uint64_t unrecovered_ffmpeg_errors =
-            UnrecoveredFfmpegErrors(snapshot);
-        total_errors +=
-            unrecovered_ffmpeg_errors + snapshot.vdec.errors + snapshot.ivps.errors;
+        total_errors += snapshot.fatal_ffmpeg_errors + snapshot.vdec.errors +
+                        snapshot.ivps.errors;
 
         double recovery_downtime_ms = snapshot.completed_recovery_downtime_ms;
         if (snapshot.recovery_started != Clock::time_point{}) {
@@ -3484,7 +3948,9 @@ void PrintMultiStatistics(const Options& options, Clock::time_point started,
                 "send_avg_ms=%.3f send_max_ms=%.3f pending_au=%u pending_frames=%u "
                 "ivps_frames=%llu ivps_errors=%llu ivps_avg_ms=%.3f infer_frames=%llu "
                 "infer_errors=%llu detections=%llu rate_skips=%llu busy_drops=%llu "
-                "latest_replacements=%llu ffmpeg_errors=%llu recovered_ffmpeg_errors=%llu "
+                "latest_replacements=%llu ffmpeg_errors=%llu corrupt_packets=%llu "
+                "recoverable_rtsp_errors=%llu fatal_ffmpeg_errors=%llu "
+                "pending_recovery_errors=%llu recovered_ffmpeg_errors=%llu "
                 "skipped_before_idr=%llu "
                 "recovery_attempts=%llu recovery_successes=%llu recovery_failures=%llu "
                 "recovery_downtime_ms=%.3f",
@@ -3521,6 +3987,10 @@ void PrintMultiStatistics(const Options& options, Clock::time_point started,
                 static_cast<unsigned long long>(snapshot.busy_drops),
                 static_cast<unsigned long long>(snapshot.latest_replacements),
                 static_cast<unsigned long long>(snapshot.ffmpeg_errors),
+                static_cast<unsigned long long>(snapshot.corrupt_packets),
+                static_cast<unsigned long long>(snapshot.recoverable_rtsp_errors),
+                static_cast<unsigned long long>(snapshot.fatal_ffmpeg_errors),
+                static_cast<unsigned long long>(snapshot.pending_recovery_errors),
                 static_cast<unsigned long long>(snapshot.recovered_ffmpeg_errors),
                 static_cast<unsigned long long>(snapshot.skipped_before_idr),
                 static_cast<unsigned long long>(snapshot.recovery_attempts),
@@ -3727,8 +4197,13 @@ int Run(const Options& options) {
         routes.emplace_back(std::make_unique<CameraRoute>(camera_id, &stop_requested));
         CameraRoute& route = *routes.back();
         ScopedCameraLogContext log_context(static_cast<int>(camera_id));
-        if (!environment.EnsureCurrentContext() ||
-            !route.vdec.Open(kSourceWidth, kSourceHeight) ||
+        if (!environment.EnsureCurrentContext()) {
+            LogError("[SYSTEM] camera startup failed");
+            return -1;
+        }
+        const VdecOpenResult vdec_open =
+            route.vdec.Open(kSourceWidth, kSourceHeight);
+        if (!vdec_open.successful() ||
             (options.mode != RunMode::kVdecSmoke && !route.ivps.Open())) {
             LogError("[SYSTEM] camera startup failed");
             return -1;
@@ -3766,8 +4241,12 @@ int Run(const Options& options) {
                 "fixed timeline, skip missed slots",
                 kInferenceLimitFps, inference_period_ms, camera_phase_step_ms);
     }
-    LogInfo("[CONFIG] recovery_scope=single-camera VDEC stream/hardware faults; "
-            "backoff=1,2,5,10,30s; standalone RTSP/IVPS/inference/context faults remain fatal");
+    LogInfo("[CONFIG] recovery_scope=single-camera recoverable RTSP transport and confirmed "
+            "VDEC stream faults share one budget; max_attempts=%u retry_delay_s=%lld "
+            "stable_window_s=%lld; input/internal/cleanup/context/IVPS/inference faults remain fatal",
+            kCameraRecoveryMaxAttempts,
+            static_cast<long long>(kCameraRecoveryRetryDelay.count()),
+            static_cast<long long>(kCameraRecoveryStableWindow.count()));
     if (!options.dump_ivps.empty()) {
         LogInfo("[CONFIG] --dump-ivps writes camera 0 only");
     }
@@ -3892,8 +4371,6 @@ int Run(const Options& options) {
         CameraRoute& route = *routes[camera_id];
         const RouteSnapshot snapshot = route.ReadSnapshot();
         ScopedCameraLogContext log_context(static_cast<int>(camera_id));
-        const std::uint64_t unrecovered_ffmpeg_errors =
-            UnrecoveredFfmpegErrors(snapshot);
         const bool route_unavailable = snapshot.state == CameraRunState::kReconnecting ||
                                        snapshot.state == CameraRunState::kFailed ||
                                        snapshot.state == CameraRunState::kStarting ||
@@ -3901,12 +4378,13 @@ int Run(const Options& options) {
         if (route_unavailable || snapshot.vdec.decoded_frames == 0 ||
             snapshot.vdec.errors != 0 ||
             snapshot.vdec.current_hardware_decode_errors != 0 ||
-            unrecovered_ffmpeg_errors != 0) {
+            snapshot.fatal_ffmpeg_errors != 0) {
             LogError("[FINAL] decode validation failed: state=%s decoded_frames=%llu "
                      "vdec_errors=%llu vdec_stream_errors=%llu vdec_hw_errors=%llu "
-                     "vdec_current_hw_errors=%llu ffmpeg_errors=%llu "
-                     "recovered_ffmpeg_errors=%llu recovery_attempts=%llu recovery_successes=%llu "
-                     "recovery_failures=%llu",
+                     "vdec_current_hw_errors=%llu ffmpeg_errors=%llu corrupt_packets=%llu "
+                     "recoverable_rtsp_errors=%llu fatal_ffmpeg_errors=%llu "
+                     "pending_recovery_errors=%llu recovered_ffmpeg_errors=%llu "
+                     "recovery_attempts=%llu recovery_successes=%llu recovery_failures=%llu",
                      CameraRunStateName(snapshot.state),
                      static_cast<unsigned long long>(snapshot.vdec.decoded_frames),
                      static_cast<unsigned long long>(snapshot.vdec.errors),
@@ -3915,6 +4393,10 @@ int Run(const Options& options) {
                      static_cast<unsigned long long>(
                          snapshot.vdec.current_hardware_decode_errors),
                      static_cast<unsigned long long>(snapshot.ffmpeg_errors),
+                     static_cast<unsigned long long>(snapshot.corrupt_packets),
+                     static_cast<unsigned long long>(snapshot.recoverable_rtsp_errors),
+                     static_cast<unsigned long long>(snapshot.fatal_ffmpeg_errors),
+                     static_cast<unsigned long long>(snapshot.pending_recovery_errors),
                      static_cast<unsigned long long>(snapshot.recovered_ffmpeg_errors),
                      static_cast<unsigned long long>(snapshot.recovery_attempts),
                      static_cast<unsigned long long>(snapshot.recovery_successes),
