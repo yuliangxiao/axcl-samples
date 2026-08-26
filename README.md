@@ -193,7 +193,9 @@ build-native\examples\axcl\ax_yolo26_rtsp_native.exe
 
 完整推理模式会在推理启动满 10 秒后监测每路滚动 10 秒推理 FPS。低于 `10` 时输出性能警告但继续
 运行：进入低帧率状态时立即提示，持续异常最多每 30 秒重复一次，恢复后提示一次。单路处于
-`reconnecting` 时暂停该路监测，并在恢复出首个正常解码画面且 VDEC 当前状态正常后重新累计 10 秒窗口。
+`reconnecting` 或 `resynchronizing` 时暂停该路监测，并在路线恢复 `running` 后重新累计 10 秒窗口。
+单调递增的 `resync_generation` 还能识别两个统计周期之间已开始并完成的短暂重同步，防止旧窗口跨越
+包级重同步继续累计。
 
 在 Windows 中直接双击 `.exe`，程序结束后会提示按任意键关闭窗口；从已有 Developer Command Prompt
 或其他共享控制台启动时不会暂停。IDE（集成开发环境）或脚本如果为程序创建独立控制台，也可能触发
@@ -205,10 +207,13 @@ Linux 不启用退出暂停。
 `send_task_timeouts`、`recovered_task_timeouts`、`unrecovered_task_timeouts`、
 `consecutive_task_timeouts`、`max_consecutive_task_timeouts`、`slow_sends`、`send_avg_ms`、
 `send_max_ms`、`latest_replacements`、`vdec_stream_errors`、`last_error_code`、
-`corrupt_packets`、`recoverable_rtsp_errors`、`fatal_ffmpeg_errors`、`pending_recovery_errors`、
-`recovery_attempts`、`recovery_successes`、`recovery_failures`、`recovered_ffmpeg_errors` 和
-`recovery_downtime_ms` 等累计指标；其中 `ffmpeg_errors` 是 FFmpeg 累计诊断数，不直接决定退出码，
+`corrupt_packets`、`invalid_h264_packets`、`resync_generation`、`recoverable_rtsp_errors`、
+`fatal_ffmpeg_errors`、`pending_recovery_errors`、`recovery_attempts`、`recovery_successes`、
+`recovery_failures`、`recovered_ffmpeg_errors` 和 `recovery_downtime_ms` 等累计指标；其中 `ffmpeg_errors` 是
+FFmpeg 累计诊断数，不直接决定退出码，
 `recovery_attempts/successes/failures` 也是进程生命周期累计值，不充当或重置当前三次预算。
+`invalid_h264_packets` 专门统计本地 H.264 结构校验发现并丢弃的包；`resync_generation` 供性能监测丢弃
+跨重同步的旧窗口。
 `send_calls` 还包含队列满重试和 EOS（码流结束标记）发送。单次 `AXCL_VDEC_SendStream` 达到 `50 ms`
 会记录慢调用；送流失败时会记录错误码分解、PTS、数据大小和一次故障现场
 `AXCL_VDEC_QueryStatus` 快照。Runtime Task（运行时任务）超时时不会重发结果不确定的 AU：设备状态确认
@@ -216,10 +221,23 @@ Linux 不启用退出暂停。
 已确认暂态错误，仍视为不可恢复错误；连续三次任务超时也会协调停止全部四路并返回 `-1`。
 
 程序成功启动后，RTSP 读取超时、EOF（流结束）、连接重置及已分类网络/I/O（输入输出）错误只触发
-故障相机路恢复；`AV_PKT_FLAG_CORRUPT` 标记的单个损坏包只增加 `corrupt_packets`，丢弃后等待下一个
-IDR（即时解码刷新）关键帧，不重连。BSF（比特流过滤器）、Annex-B、输入规格、内存或内部状态错误仍
-立即全局失败。每次可恢复 RTSP 事件立即计入 `recoverable_rtsp_errors` 和待确认数；首个健康画面出现时，
-待确认数转入 `recovered_ffmpeg_errors`。已恢复的历史错误和损坏包不影响健康退出。
+故障相机路恢复；`AV_PKT_FLAG_CORRUPT` 标记的单个损坏包计入 `corrupt_packets` 和 `ffmpeg_errors`，
+丢弃后等待下一个
+IDR（即时解码刷新）关键帧，不立即重连。每次可恢复 RTSP 事件立即计入 `recoverable_rtsp_errors` 和待确认数；
+首个健康画面出现时，待确认数转入 `recovered_ffmpeg_errors`。已恢复的历史错误和损坏包不影响健康退出。
+
+> **运行期 H.264 包级重同步**：输入会话成功打开后（包括首个 IDR 到达前），运行期包未设置
+> `AV_PKT_FLAG_CORRUPT`，但本地校验发现空包、非 Annex-B、无有效
+> NAL（网络抽象层单元）或 NAL 头、类型、载荷长度无效时，程序增加
+> `invalid_h264_packets`、丢弃该包并开始包级重同步。未处于会话恢复的路线发布 `resynchronizing`；仍在
+> 恢复且尚无健康解码帧的路线按优先级继续发布 `reconnecting`。后续非 IDR 画面继续丢弃，首个有效 IDR
+> 只有在 VDEC 送流成功后才结束包级重同步；非恢复路线恢复 `running`，恢复路线仍须等首帧和 VDEC 状态
+> 健康后才能恢复 `running`。读取截止前仍无有效 IDR 时才进入上述单路恢复。空包检查位于可选 BSF（比特流
+> 过滤器）之前，其他 Annex-B/NAL 检查针对可选 BSF 输出；初始输入规格、BSF、内存、内部状态和资源
+> 错误仍立即全局失败。
+
+完整边界见[单路有界恢复需求](docs/requirements/2026-08-24-172111-rtsp-vdec-单路有界恢复.md)和
+[ADR 0002](docs/adr/0002-use-idr-resynchronization-for-runtime-malformed-packets.md)。
 
 VDEC 仅将 SDK 明确返回的 `AX_ERR_VDEC_STRM_ERROR` 作为单路可恢复码流错误；没有目标 SDK 明确语义
 依据时不扩展其他暂态白名单，因此 `format_err`、`pic_size_err`、`stream_unsupported`、`pack_err`、
@@ -237,6 +255,8 @@ VDEC 仅将 SDK 明确返回的 `AX_ERR_VDEC_STRM_ERROR` 作为单路可恢复�
 
 下列条件分别适用于 `vdec-smoke`、`ivps-smoke` 和 `infer`。应使用能定向中断单个 RTSP 客户端会话的
 受控服务端或代理，并根据日志时间戳和分类字段验收；整机断网不能证明健康相机路仍在继续处理。
+带 `resynchronizing` 或 `invalid_h264_packets` 的条目需要受控坏包注入和目标机日志证明；仅有源码静态检查
+不得标记为运行验收通过。
 
 - 健康基线下四路持续处理并返回 `0`；初次任一路打不开时没有恢复尝试并返回 `-1`。
 - 运行期单路超时、EOF、Windows 原始 Winsock 连接重置值 `-10054` 或 FFmpeg 已归一化网络/I/O 错误
@@ -245,10 +265,14 @@ VDEC 仅将 SDK 明确返回的 `AX_ERR_VDEC_STRM_ERROR` 作为单路可恢复�
   没有 attempt 4，全部路线完成清理并返回 `-1`。
 - RTSP/VDEC 交错故障及首帧后 30 秒内复发继续使用原预算；连续健康 30 秒后的下一次故障从 attempt 1
   重新开始。多路同时故障各自计数，任一路先耗尽即全局失败。
-- 损坏标记包只被丢弃并等待 IDR，健康结束仍返回 `0`；非 H.264、分辨率变化、无效 Annex-B/BSF、
-  内存/内部状态、Context、VDEC 清理、IVPS 或共享推理故障不消耗恢复预算并立即全局失败。
+- `AV_PKT_FLAG_CORRUPT` 包增加 `corrupt_packets`；运行期本地校验发现的可丢弃码流包增加
+  `invalid_h264_packets`。两者均不送入 VDEC，而是开始包级重同步并等待有效 IDR；未处于会话恢复时对外
+  进入 `resynchronizing`。IDR 成功送流后不消耗恢复预算且最终健康结束返回 `0`；超时后才按当前已用
+  预算开始下一次单路恢复，当前没有已用预算时为 attempt 1。
+- 非 H.264、分辨率变化、无效 extradata、BSF、SPS/PPS 缓存超限、内存/内部状态、Context、VDEC
+  清理、IVPS 或共享推理故障不消耗恢复预算并立即全局失败。
 - Ctrl+C 或 `--duration` 到期时，首个健康帧已经出现但尚在稳定窗口内的 `running` 路线可以返回 `0`；
-  任一路仍为 `reconnecting` 或 `failed` 时完成有序清理并返回 `-1`。
+  任一路仍为 `resynchronizing`、`reconnecting` 或 `failed` 时完成有序清理并返回 `-1`。
 
 ### 阶段一：VDEC smoke
 
@@ -263,8 +287,9 @@ build-native\examples\axcl\ax_yolo26_rtsp_native.exe --mode vdec-smoke --duratio
 - 四个 VDEC Group 均输出 `2560x1440`、NV12，各路 `decoded_fps` 接近视频源帧率；
 - 每个 Group 使用 8 个输出帧缓冲，四路合计 32 个，避免沿用原单路 32 个后直接放大四倍 CMM；
 - 最终每路日志中 `vdec_errors=0`、`vdec_current_hw_errors=0`、`fatal_ffmpeg_errors=0`，且退出时不处于
-  `reconnecting`/`failed`；历史 `vdec_stream_errors`、`recoverable_rtsp_errors`、`corrupt_packets` 和
-  `ffmpeg_errors` 可以非零，已恢复的 RTSP 错误应计入 `recovered_ffmpeg_errors`；
+  `resynchronizing`/`reconnecting`/`failed`；历史 `vdec_stream_errors`、`recoverable_rtsp_errors`、
+  `corrupt_packets`、`invalid_h264_packets` 和 `ffmpeg_errors` 可以非零，已恢复的 RTSP 错误应计入
+  `recovered_ffmpeg_errors`；
 - `send_task_timeouts=0` 最佳；若非零，应全部计入 `recovered_task_timeouts`，且
   `max_consecutive_task_timeouts < 3`；
 - `full_retries` 可以非零，但不能持续增长并导致 FPS 停滞。
@@ -300,7 +325,8 @@ build-native\examples\axcl\ax_yolo26_rtsp_native.exe --mode infer --duration 60 
   如果单推理实例不足以处理约 44 FPS，旧候选帧会被最新帧覆盖而不积压；
 - 四路 `infer_frames` 均持续增加、`infer_errors=0`，日志中的每条 `[DETECTION]` 都包含 `camera=0～3`；
 - VDEC 致命错误、当前硬件错误、`fatal_ffmpeg_errors` 和 IVPS 错误计数仍为 0；允许历史
-  `vdec_stream_errors`、`recoverable_rtsp_errors`、`corrupt_packets` 和 `ffmpeg_errors` 非零；
+  `vdec_stream_errors`、`recoverable_rtsp_errors`、`corrupt_packets`、`invalid_h264_packets` 和
+  `ffmpeg_errors` 非零；
 - 正式链路没有 Host 视频解码、resize、CSC 或 NPU 输入 H2D（主机到设备）复制；每个候选帧只执行
   一次约 1.2 MB 的设备内 D2D 复制。
 
@@ -308,9 +334,12 @@ build-native\examples\axcl\ax_yolo26_rtsp_native.exe --mode infer --duration 60 
 （运行时上下文）、VDEC Group 和 IVPS 最新帧槽；四路共享一个模型和一个推理线程。每路使用固定单调
 时间轴限制为最多 11 FPS，四路相位按约 90.909 ms 的周期均匀错开；错过的节拍直接跳过，只处理最新帧，
 不补做历史帧。运行期已分类的 RTSP 传输故障与 `AX_ERR_VDEC_STRM_ERROR` 按上述共享预算执行单路重建；
-其他输入、内部状态和共享处理错误仍停止全部路线。`--read-timeout` 只控制单次 RTSP 打开或读取超时，
-不改变恢复次数、间隔或稳定窗口。`--duration 0` 表示持续运行直到 Ctrl+C 或发生错误，与累计识别帧数
-无关；到期或用户停止时仍有路线处于 `reconnecting`/`failed` 会返回 `-1`。
+当前实现中的其他输入、内部状态和共享处理错误仍停止全部路线，只放宽其中可在送入 VDEC 前隔离的运行期
+单包内容错误。`--read-timeout` 只控制单次 RTSP 打开或读取超时，
+不改变恢复次数、间隔或稳定窗口；IDR 重同步也复用固定读取截止时间，同一轮不会因状态事件、
+再次读取、连续坏包或连续非 IDR 刷新该时间，也不增加独立参数或坏包频率阈值。`--duration 0` 表示持续
+运行直到 Ctrl+C 或发生错误，与累计识别帧数无关；到期或用户停止时仍有
+路线处于 `resynchronizing`/`reconnecting`/`failed` 会返回 `-1`。
 
 ### 每秒刷新 AX8850 设备状态
 

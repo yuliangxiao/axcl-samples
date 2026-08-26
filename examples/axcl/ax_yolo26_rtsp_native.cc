@@ -119,6 +119,7 @@ constexpr std::chrono::microseconds kCameraPhaseStep{
 constexpr double kMinimumInferenceFps = 10.0;
 constexpr std::chrono::seconds kInferenceRateWindow{10};
 constexpr std::chrono::seconds kLowInferenceWarningRepeat{30};
+constexpr std::chrono::seconds kIdrResyncWarningRepeat{30};
 constexpr std::uint32_t kCameraRecoveryMaxAttempts = 3;
 constexpr std::chrono::seconds kCameraRecoveryRetryDelay{30};
 constexpr std::chrono::seconds kCameraRecoveryStableWindow{30};
@@ -859,6 +860,7 @@ struct AccessUnit {
 
 enum class RtspIoStatus {
     kSuccess,
+    kResynchronizing,
     kRecoverableFailure,
     kFatalFailure,
     kInterrupted,
@@ -896,6 +898,7 @@ struct RtspReadResult {
 enum class BuildAccessUnitResult {
     kAccepted,
     kSkipped,
+    kResyncStarted,
     kFatal,
 };
 
@@ -1221,8 +1224,11 @@ public:
             return RecordReadFailure(RtspFailureReason::kInvalidState,
                                      AVERROR(EINVAL), false);
         }
-        const std::int64_t deadline_us =
-            timeout_us > 0 ? av_gettime_relative() + timeout_us : 0;
+        const std::int64_t deadline_us = resync_active_
+                                             ? resync_deadline_us_
+                                             : timeout_us > 0
+                                                   ? av_gettime_relative() + timeout_us
+                                                   : 0;
 
         while (true) {
             if (StopRequested()) {
@@ -1230,9 +1236,7 @@ public:
                         RtspFailureReason::kStopRequested, AVERROR_EXIT};
             }
             if (deadline_us != 0 && av_gettime_relative() >= deadline_us) {
-                LogError("[FFMPEG] RTSP read deadline expired");
-                return RecordReadFailure(RtspFailureReason::kTimeout,
-                                         FfmpegTimeoutError(), true);
+                return RecordReadTimeout("read-loop", FfmpegTimeoutError());
             }
             AVPacket* output = nullptr;
             AVRational output_time_base = stream_->time_base;
@@ -1277,10 +1281,14 @@ public:
             }
 
             const BuildAccessUnitResult build_result =
-                BuildAccessUnit(*output, output_time_base, access_unit);
+                BuildAccessUnit(*output, output_time_base, deadline_us, access_unit);
             av_packet_unref(output);
             if (build_result == BuildAccessUnitResult::kAccepted) {
                 return {RtspIoStatus::kSuccess, RtspFailureReason::kNone, 0};
+            }
+            if (build_result == BuildAccessUnitResult::kResyncStarted) {
+                return {RtspIoStatus::kResynchronizing,
+                        RtspFailureReason::kNone, 0};
             }
             if (build_result == BuildAccessUnitResult::kFatal) {
                 return RecordReadFailure(RtspFailureReason::kInvalidPacket,
@@ -1314,12 +1322,20 @@ public:
         }
         stream_ = nullptr;
         video_stream_index_ = -1;
+        resync_active_ = false;
+        resync_deadline_us_ = 0;
+        resync_started_ = Clock::time_point{};
+        resync_dropped_packets_ = 0;
     }
 
     std::uint64_t input_packets() const { return input_packets_; }
     std::uint64_t skipped_before_idr() const { return skipped_before_idr_; }
     std::uint64_t ffmpeg_errors() const { return ffmpeg_errors_; }
     std::uint64_t corrupt_packets() const { return corrupt_packets_; }
+    std::uint64_t invalid_h264_packets() const { return invalid_h264_packets_; }
+    std::uint64_t resync_generation() const { return resync_generation_; }
+    bool resynchronizing() const { return resync_active_; }
+    Clock::time_point resync_started() const { return resync_started_; }
     std::uint64_t recoverable_transport_errors() const {
         return recoverable_transport_errors_;
     }
@@ -1332,10 +1348,38 @@ public:
         return confirmed;
     }
 
-    void RequestIdrResync() {
-        waiting_for_idr_ = true;
-        pre_idr_parameter_sets_.clear();
-        LogWarning("[FFMPEG] VDEC send result was not confirmed; waiting for the next IDR");
+    bool RequestIdrResync(std::uint64_t access_unit_sequence,
+                          std::size_t access_unit_size) {
+        const std::int64_t deadline_us = resync_active_
+                                             ? resync_deadline_us_
+                                             : timeout_us_ > 0
+                                                   ? av_gettime_relative() + timeout_us_
+                                                   : 0;
+        return BeginIdrResync(deadline_us, "vdec-send-unconfirmed", "au",
+                              access_unit_sequence, access_unit_size);
+    }
+
+    bool ConfirmIdrResync(std::uint64_t access_unit_sequence,
+                          std::size_t access_unit_size,
+                          Clock::time_point completed_at) {
+        if (!resync_active_) {
+            return false;
+        }
+
+        const std::uint64_t generation = resync_generation_;
+        const std::uint64_t dropped_packets = resync_dropped_packets_;
+        const double elapsed_ms = ElapsedMilliseconds(resync_started_, completed_at);
+        LogInfo("[RESYNC] completed: generation=%llu elapsed_ms=%.3f "
+                "dropped_packets=%llu au_seq=%llu bytes=%zu vdec_send=success",
+                static_cast<unsigned long long>(generation), elapsed_ms,
+                static_cast<unsigned long long>(dropped_packets),
+                static_cast<unsigned long long>(access_unit_sequence),
+                access_unit_size);
+        resync_active_ = false;
+        resync_deadline_us_ = 0;
+        resync_started_ = Clock::time_point{};
+        resync_dropped_packets_ = 0;
+        return true;
     }
 
 private:
@@ -1351,6 +1395,83 @@ private:
         const std::int64_t deadline_us =
             interrupt_->deadline_us.load(std::memory_order_relaxed);
         return deadline_us != 0 && av_gettime_relative() >= deadline_us;
+    }
+
+    void MaybeLogIdrResyncWarning(const char* reason, const char* source,
+                                  std::uint64_t sequence, std::size_t bytes) {
+        const auto now = Clock::now();
+        if (last_resync_warning_ != Clock::time_point{} &&
+            now - last_resync_warning_ < kIdrResyncWarningRepeat) {
+            return;
+        }
+        last_resync_warning_ = now;
+        LogWarning("[RESYNC] discarded H.264 input: generation=%llu reason=%s "
+                   "source=%s sequence=%llu bytes=%zu action=discard-wait-for-idr",
+                   static_cast<unsigned long long>(resync_generation_), reason, source,
+                   static_cast<unsigned long long>(sequence), bytes);
+    }
+
+    bool BeginIdrResync(std::int64_t deadline_us, const char* reason,
+                        const char* source, std::uint64_t sequence,
+                        std::size_t bytes) {
+        waiting_for_idr_ = true;
+        pre_idr_parameter_sets_.clear();
+
+        const bool started = !resync_active_;
+        if (started) {
+            resync_active_ = true;
+            resync_deadline_us_ = deadline_us;
+            resync_started_ = Clock::now();
+            resync_dropped_packets_ = 0;
+            ++resync_generation_;
+            LogInfo("[RESYNC] started: generation=%llu deadline_us=%lld reason=%s "
+                    "source=%s sequence=%llu bytes=%zu "
+                    "action=discard-wait-for-idr",
+                    static_cast<unsigned long long>(resync_generation_),
+                    static_cast<long long>(resync_deadline_us_), reason, source,
+                    static_cast<unsigned long long>(sequence), bytes);
+        }
+        ++resync_dropped_packets_;
+        MaybeLogIdrResyncWarning(reason, source, sequence, bytes);
+        return started;
+    }
+
+    void RecordIdrWaitDrop(std::uint64_t packet_sequence, std::size_t bytes) {
+        ++skipped_before_idr_;
+        if (!resync_active_) {
+            return;
+        }
+        ++resync_dropped_packets_;
+        MaybeLogIdrResyncWarning("waiting-for-idr", "packet",
+                                 packet_sequence, bytes);
+    }
+
+    BuildAccessUnitResult DiscardInvalidH264Packet(
+        const AVPacket& packet, std::int64_t deadline_us, const char* reason) {
+        ++ffmpeg_errors_;
+        ++invalid_h264_packets_;
+        const std::size_t packet_size =
+            packet.size > 0 ? static_cast<std::size_t>(packet.size) : 0;
+        const bool started = BeginIdrResync(deadline_us, reason, "packet",
+                                            input_packets_, packet_size);
+        return started ? BuildAccessUnitResult::kResyncStarted
+                       : BuildAccessUnitResult::kSkipped;
+    }
+
+    RtspReadResult RecordReadTimeout(const char* location, int error) {
+        if (resync_active_) {
+            LogError("[RESYNC] deadline expired: generation=%llu deadline_us=%lld "
+                     "elapsed_ms=%.3f dropped_packets=%llu location=%s "
+                     "action=camera-local-recovery",
+                     static_cast<unsigned long long>(resync_generation_),
+                     static_cast<long long>(resync_deadline_us_),
+                     ElapsedMilliseconds(resync_started_),
+                     static_cast<unsigned long long>(resync_dropped_packets_),
+                     location);
+        } else {
+            LogError("[FFMPEG] RTSP read deadline expired: location=%s", location);
+        }
+        return RecordReadFailure(RtspFailureReason::kTimeout, error, true);
     }
 
     RtspOpenResult RecordOpenFailure(RtspFailureReason reason, int error,
@@ -1427,9 +1548,8 @@ private:
                         RtspFailureReason::kStopRequested, AVERROR_EXIT};
             }
             if (deadline_us != 0 && av_gettime_relative() >= deadline_us) {
-                LogError("[FFMPEG] RTSP read deadline expired");
-                return RecordReadFailure(RtspFailureReason::kTimeout,
-                                         FfmpegTimeoutError(), true);
+                return RecordReadTimeout("selected-packet-loop",
+                                         FfmpegTimeoutError());
             }
             av_packet_unref(packet_);
             if (interrupt_ != nullptr) {
@@ -1448,10 +1568,16 @@ private:
                 LogError("[FFMPEG] RTSP stream reached EOF");
                 return RecordReadFailure(RtspFailureReason::kEndOfStream, ret, true);
             }
-            if (ret < 0 && timed_out) {
-                LogError("[FFMPEG] av_read_frame timed out: %s (%d)",
-                         AvErrorText(ret).c_str(), ret);
-                return RecordReadFailure(RtspFailureReason::kTimeout, ret, true);
+            if (timed_out) {
+                if (ret < 0) {
+                    LogError("[FFMPEG] av_read_frame timed out: %s (%d)",
+                             AvErrorText(ret).c_str(), ret);
+                } else {
+                    LogError("[FFMPEG] packet arrived after the read deadline");
+                    av_packet_unref(packet_);
+                }
+                return RecordReadTimeout(
+                    "av-read-frame", ret < 0 ? ret : FfmpegTimeoutError());
             }
             if (ret == AVERROR(EAGAIN) || ret == AVERROR(EINTR)) {
                 continue;
@@ -1483,10 +1609,31 @@ private:
             if ((packet_->flags & AV_PKT_FLAG_CORRUPT) != 0) {
                 ++ffmpeg_errors_;
                 ++corrupt_packets_;
-                waiting_for_idr_ = true;
-                pre_idr_parameter_sets_.clear();
-                LogWarning("[FFMPEG] discard packet marked corrupt, packet=%llu",
-                           static_cast<unsigned long long>(input_packets_));
+                const std::size_t packet_size =
+                    packet_->size > 0 ? static_cast<std::size_t>(packet_->size) : 0;
+                const bool started = BeginIdrResync(
+                    deadline_us, "ffmpeg-corrupt-flag", "packet",
+                    input_packets_, packet_size);
+                av_packet_unref(packet_);
+                if (started) {
+                    return {RtspIoStatus::kResynchronizing,
+                            RtspFailureReason::kNone, 0};
+                }
+                continue;
+            }
+            if (packet_->data == nullptr || packet_->size <= 0) {
+                ++ffmpeg_errors_;
+                ++invalid_h264_packets_;
+                const std::size_t packet_size =
+                    packet_->size > 0 ? static_cast<std::size_t>(packet_->size) : 0;
+                const bool started = BeginIdrResync(
+                    deadline_us, "empty-video-packet", "packet",
+                    input_packets_, packet_size);
+                av_packet_unref(packet_);
+                if (started) {
+                    return {RtspIoStatus::kResynchronizing,
+                            RtspFailureReason::kNone, 0};
+                }
                 continue;
             }
             return {RtspIoStatus::kSuccess, RtspFailureReason::kNone, 0};
@@ -1494,22 +1641,25 @@ private:
     }
 
     BuildAccessUnitResult BuildAccessUnit(const AVPacket& packet, AVRational time_base,
+                                          std::int64_t deadline_us,
                                           AccessUnit* access_unit) {
-        if (packet.data == nullptr || packet.size <= 0 || access_unit == nullptr) {
-            LogError("[FFMPEG] invalid demuxed packet: data=%p size=%d access_unit=%p",
-                     static_cast<void*>(packet.data), packet.size, static_cast<void*>(access_unit));
+        if (access_unit == nullptr) {
+            LogError("[FFMPEG] BuildAccessUnit called with null output pointer");
             return BuildAccessUnitResult::kFatal;
         }
+        if (packet.data == nullptr || packet.size <= 0) {
+            return DiscardInvalidH264Packet(packet, deadline_us,
+                                            "empty-filtered-packet");
+        }
         if (!HasAnnexBPrefix(packet.data, static_cast<std::size_t>(packet.size))) {
-            LogError("[FFMPEG] demuxed H.264 packet is not Annex-B; refusing to guess packet format");
-            return BuildAccessUnitResult::kFatal;
+            return DiscardInvalidH264Packet(packet, deadline_us,
+                                            "missing-annex-b-start-code");
         }
 
         const auto summary = InspectAnnexBNals(packet.data, static_cast<std::size_t>(packet.size));
         if (!summary.has_valid_nal || summary.has_invalid_nal) {
-            LogError("[FFMPEG] demuxed Annex-B packet contains no valid H.264 NAL or has "
-                     "an invalid NAL header");
-            return BuildAccessUnitResult::kFatal;
+            return DiscardInvalidH264Packet(packet, deadline_us,
+                                            "invalid-annex-b-nal");
         }
 
         if (waiting_for_idr_ && !summary.has_idr) {
@@ -1523,7 +1673,8 @@ private:
                 pre_idr_parameter_sets_.insert(pre_idr_parameter_sets_.end(),
                                                packet.data, packet.data + packet.size);
             }
-            ++skipped_before_idr_;
+            RecordIdrWaitDrop(input_packets_,
+                              static_cast<std::size_t>(packet.size));
             return BuildAccessUnitResult::kSkipped;
         }
 
@@ -1599,12 +1750,19 @@ private:
     std::uint64_t skipped_before_idr_{0};
     std::uint64_t ffmpeg_errors_{0};
     std::uint64_t corrupt_packets_{0};
+    std::uint64_t invalid_h264_packets_{0};
     std::uint64_t recoverable_transport_errors_{0};
     std::uint64_t fatal_errors_{0};
     std::uint64_t pending_recovery_errors_{0};
     std::uint64_t synthetic_pts_us_{0};
+    std::uint64_t resync_generation_{0};
+    std::uint64_t resync_dropped_packets_{0};
+    std::int64_t resync_deadline_us_{0};
+    Clock::time_point resync_started_{};
+    Clock::time_point last_resync_warning_{};
     double reported_fps_{0.0};
     bool waiting_for_idr_{true};
+    bool resync_active_{false};
 };
 
 bool RecordCleanupResult(const char* api, AX_S32 result) {
@@ -2987,6 +3145,7 @@ enum class CameraRunState {
     kStarting,
     kReady,
     kRunning,
+    kResynchronizing,
     kReconnecting,
     kFailed,
     kStopped,
@@ -3000,6 +3159,8 @@ const char* CameraRunStateName(CameraRunState state) {
         return "ready";
     case CameraRunState::kRunning:
         return "running";
+    case CameraRunState::kResynchronizing:
+        return "resynchronizing";
     case CameraRunState::kReconnecting:
         return "reconnecting";
     case CameraRunState::kFailed:
@@ -3016,6 +3177,8 @@ struct RouteSnapshot {
     std::uint64_t skipped_before_idr{0};
     std::uint64_t ffmpeg_errors{0};
     std::uint64_t corrupt_packets{0};
+    std::uint64_t invalid_h264_packets{0};
+    std::uint64_t resync_generation{0};
     std::uint64_t recoverable_rtsp_errors{0};
     std::uint64_t fatal_ffmpeg_errors{0};
     std::uint64_t pending_recovery_errors{0};
@@ -3055,6 +3218,8 @@ public:
         next.skipped_before_idr = demuxer.skipped_before_idr();
         next.ffmpeg_errors = demuxer.ffmpeg_errors();
         next.corrupt_packets = demuxer.corrupt_packets();
+        next.invalid_h264_packets = demuxer.invalid_h264_packets();
+        next.resync_generation = demuxer.resync_generation();
         next.recoverable_rtsp_errors = demuxer.recoverable_transport_errors();
         next.fatal_ffmpeg_errors = demuxer.fatal_errors();
         next.pending_recovery_errors = demuxer.pending_recovery_errors();
@@ -3195,6 +3360,7 @@ struct StatisticsTracker {
     std::array<std::uint64_t, kCameraCount> inference_frames{};
     std::array<std::uint64_t, kCameraCount> rate_skips{};
     std::array<std::uint64_t, kCameraCount> busy_drops{};
+    std::array<std::uint64_t, kCameraCount> resync_generations{};
     std::array<InferenceRateMonitor, kCameraCount> inference_rate_monitors{};
     std::uint64_t total_inference_frames{0};
     double inference_total_ms{0.0};
@@ -3392,10 +3558,9 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
             return kCameraRecoveryMaxAttempts - recovery_attempts_used;
         };
 
-        const auto reset_stable_budget_if_due = [&] {
-            const auto now = Clock::now();
+        const auto reset_stable_budget_if_due = [&](Clock::time_point healthy_until) {
             if (recovering || recovery_stable_deadline == Clock::time_point{} ||
-                now < recovery_stable_deadline) {
+                healthy_until < recovery_stable_deadline) {
                 return;
             }
             const std::uint32_t completed_attempts = recovery_attempts_used;
@@ -3440,7 +3605,10 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
         const auto start_or_restart_recovery =
             [&](const char* classification, const char* reason,
                 long long error_code) {
-                reset_stable_budget_if_due();
+                const auto healthy_until = route->demuxer.resynchronizing()
+                                               ? route->demuxer.resync_started()
+                                               : Clock::now();
+                reset_stable_budget_if_due(healthy_until);
                 const bool current_attempt_failed =
                     recovering || recovery_stable_deadline != Clock::time_point{};
                 if (current_attempt_failed &&
@@ -3494,7 +3662,9 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
             };
 
         while (!stop_requested->load(std::memory_order_relaxed)) {
-            reset_stable_budget_if_due();
+            if (!route->demuxer.resynchronizing()) {
+                reset_stable_budget_if_due(Clock::now());
+            }
             if (recovering && !session_open) {
                 route->PublishSnapshot(CameraRunState::kReconnecting);
                 if (recovery_attempts_used != 0) {
@@ -3591,6 +3761,18 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
                 static_cast<std::int64_t>(options->read_timeout_ms) * 1000;
             const RtspReadResult read_result =
                 route->demuxer.Read(&access_unit, read_timeout_us);
+            if (read_result.status == RtspIoStatus::kResynchronizing) {
+                reset_stable_budget_if_due(route->demuxer.resync_started());
+                const CameraRunState resync_state =
+                    recovering ? CameraRunState::kReconnecting
+                               : CameraRunState::kResynchronizing;
+                route->PublishSnapshot(resync_state);
+                LogInfo("[RESYNC] state event published: generation=%llu state=%s",
+                        static_cast<unsigned long long>(
+                            route->demuxer.resync_generation()),
+                        CameraRunStateName(resync_state));
+                continue;
+            }
             if (read_result.status == RtspIoStatus::kInterrupted) {
                 if (stop_requested->load(std::memory_order_relaxed)) {
                     break;
@@ -3601,8 +3783,12 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
                 break;
             }
             if (read_result.status == RtspIoStatus::kRecoverableFailure) {
+                const bool resync_timeout =
+                    route->demuxer.resynchronizing() &&
+                    read_result.reason == RtspFailureReason::kTimeout;
                 if (!start_or_restart_recovery(
-                        "rtsp-transport", RtspFailureReasonName(read_result.reason),
+                        resync_timeout ? "idr-resync-timeout" : "rtsp-transport",
+                        RtspFailureReasonName(read_result.reason),
                         read_result.error_code)) {
                     route_failed = true;
                     break;
@@ -3614,6 +3800,15 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
                          "error=%d",
                          route->camera_id, RtspFailureReasonName(read_result.reason),
                          read_result.error_code);
+                route_failed = true;
+                break;
+            }
+
+            if (route->demuxer.resynchronizing() &&
+                !access_unit.nals.has_idr) {
+                LogError("[RESYNC] non-IDR access unit escaped the resync gate; "
+                         "classification=fatal-internal-state bytes=%zu",
+                         access_unit.data.size());
                 route_failed = true;
                 break;
             }
@@ -3635,9 +3830,23 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
                 continue;
             }
             if (send_result == VdecSendResult::kNeedsIdrResync) {
-                route->demuxer.RequestIdrResync();
-                route->PublishSnapshot(recovering ? CameraRunState::kReconnecting
-                                                  : CameraRunState::kRunning);
+                const VdecStatistics vdec_statistics = route->vdec.statistics();
+                const bool resync_started = route->demuxer.RequestIdrResync(
+                    vdec_statistics.attempted_access_units,
+                    access_unit.data.size());
+                if (resync_started) {
+                    reset_stable_budget_if_due(route->demuxer.resync_started());
+                }
+                const CameraRunState resync_state =
+                    recovering ? CameraRunState::kReconnecting
+                               : CameraRunState::kResynchronizing;
+                route->PublishSnapshot(resync_state);
+                if (resync_started) {
+                    LogInfo("[RESYNC] state event published: generation=%llu state=%s",
+                            static_cast<unsigned long long>(
+                                route->demuxer.resync_generation()),
+                            CameraRunStateName(resync_state));
+                }
                 continue;
             }
             if (send_result == VdecSendResult::kFatal) {
@@ -3645,6 +3854,25 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
                     route_failed = true;
                 }
                 break;
+            }
+
+            bool resync_completed = false;
+            if (route->demuxer.resynchronizing() && access_unit.nals.has_idr) {
+                const auto completed_at = Clock::now();
+                const VdecStatistics vdec_statistics = route->vdec.statistics();
+                resync_completed = route->demuxer.ConfirmIdrResync(
+                    vdec_statistics.attempted_access_units,
+                    access_unit.data.size(), completed_at);
+                if (resync_completed && !recovering &&
+                    recovery_stable_deadline != Clock::time_point{}) {
+                    recovery_stable_deadline =
+                        completed_at + kCameraRecoveryStableWindow;
+                    LogInfo("[RECOVERY] stable window restarted after IDR resync: "
+                            "camera=%zu attempt=%u stable_s=%lld",
+                            route->camera_id, recovery_attempts_used,
+                            static_cast<long long>(
+                                kCameraRecoveryStableWindow.count()));
+                }
             }
 
             if (recovering && decoded_any) {
@@ -3699,8 +3927,19 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
                 }
                 next_status_refresh = Clock::now() + std::chrono::seconds(1);
             }
-            route->PublishSnapshot(recovering ? CameraRunState::kReconnecting
-                                              : CameraRunState::kRunning);
+            const CameraRunState next_state =
+                recovering ? CameraRunState::kReconnecting
+                           : route->demuxer.resynchronizing()
+                                 ? CameraRunState::kResynchronizing
+                                 : CameraRunState::kRunning;
+            route->PublishSnapshot(next_state);
+            if (resync_completed) {
+                LogInfo("[RESYNC] completion state published: generation=%llu "
+                        "state=%s decoded_any=%d",
+                        static_cast<unsigned long long>(
+                            route->demuxer.resync_generation()),
+                        CameraRunStateName(next_state), decoded_any ? 1 : 0);
+            }
         }
 
         if (route_failed) {
@@ -3729,9 +3968,12 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
     if (!thread_context.Close()) {
         route_failed = true;
     }
-    route->PublishSnapshot(route_failed ? CameraRunState::kFailed
-                                        : recovering ? CameraRunState::kReconnecting
-                                                     : CameraRunState::kStopped);
+    route->PublishSnapshot(
+        route_failed ? CameraRunState::kFailed
+                     : recovering ? CameraRunState::kReconnecting
+                                  : route->demuxer.resynchronizing()
+                                        ? CameraRunState::kResynchronizing
+                                        : CameraRunState::kStopped);
     if (route_failed) {
         RequestGlobalFailure(stop_requested, failed, scheduler, lifecycle_condition);
     }
@@ -3896,6 +4138,9 @@ void PrintMultiStatistics(const Options& options, Clock::time_point started,
             CounterDelta(snapshot.rate_skips, tracker->rate_skips[camera_id]);
         const std::uint64_t interval_busy_drops =
             CounterDelta(snapshot.busy_drops, tracker->busy_drops[camera_id]);
+        const bool resync_generation_changed =
+            snapshot.resync_generation !=
+            tracker->resync_generations[camera_id];
 
         char log_camera_text[256]{};
         std::snprintf(log_camera_text, sizeof(log_camera_text),
@@ -3949,6 +4194,7 @@ void PrintMultiStatistics(const Options& options, Clock::time_point started,
                 "ivps_frames=%llu ivps_errors=%llu ivps_avg_ms=%.3f infer_frames=%llu "
                 "infer_errors=%llu detections=%llu rate_skips=%llu busy_drops=%llu "
                 "latest_replacements=%llu ffmpeg_errors=%llu corrupt_packets=%llu "
+                "invalid_h264_packets=%llu resync_generation=%llu "
                 "recoverable_rtsp_errors=%llu fatal_ffmpeg_errors=%llu "
                 "pending_recovery_errors=%llu recovered_ffmpeg_errors=%llu "
                 "skipped_before_idr=%llu "
@@ -3988,6 +4234,8 @@ void PrintMultiStatistics(const Options& options, Clock::time_point started,
                 static_cast<unsigned long long>(snapshot.latest_replacements),
                 static_cast<unsigned long long>(snapshot.ffmpeg_errors),
                 static_cast<unsigned long long>(snapshot.corrupt_packets),
+                static_cast<unsigned long long>(snapshot.invalid_h264_packets),
+                static_cast<unsigned long long>(snapshot.resync_generation),
                 static_cast<unsigned long long>(snapshot.recoverable_rtsp_errors),
                 static_cast<unsigned long long>(snapshot.fatal_ffmpeg_errors),
                 static_cast<unsigned long long>(snapshot.pending_recovery_errors),
@@ -3999,7 +4247,8 @@ void PrintMultiStatistics(const Options& options, Clock::time_point started,
                 recovery_downtime_ms);
 
         if (options.mode == RunMode::kInfer && !is_final) {
-            if (snapshot.state == CameraRunState::kRunning) {
+            if (snapshot.state == CameraRunState::kRunning &&
+                !resync_generation_changed) {
                 UpdateInferenceRateMonitor(camera_id, started, now, inferred, tracker);
             } else {
                 InferenceRateMonitor& monitor =
@@ -4015,6 +4264,7 @@ void PrintMultiStatistics(const Options& options, Clock::time_point started,
         tracker->inference_frames[camera_id] = inferred;
         tracker->rate_skips[camera_id] = snapshot.rate_skips;
         tracker->busy_drops[camera_id] = snapshot.busy_drops;
+        tracker->resync_generations[camera_id] = snapshot.resync_generation;
     }
 
     const double candidate_limit =
@@ -4242,8 +4492,10 @@ int Run(const Options& options) {
                 kInferenceLimitFps, inference_period_ms, camera_phase_step_ms);
     }
     LogInfo("[CONFIG] recovery_scope=single-camera recoverable RTSP transport and confirmed "
-            "VDEC stream faults share one budget; max_attempts=%u retry_delay_s=%lld "
-            "stable_window_s=%lld; input/internal/cleanup/context/IVPS/inference faults remain fatal",
+            "VDEC stream faults share one budget; runtime malformed H.264 packets use "
+            "fixed-deadline IDR resync before recovery; max_attempts=%u retry_delay_s=%lld "
+            "stable_window_s=%lld; initial-input/BSF/memory/internal/cleanup/context/IVPS/"
+            "inference faults remain fatal",
             kCameraRecoveryMaxAttempts,
             static_cast<long long>(kCameraRecoveryRetryDelay.count()),
             static_cast<long long>(kCameraRecoveryStableWindow.count()));
@@ -4371,7 +4623,8 @@ int Run(const Options& options) {
         CameraRoute& route = *routes[camera_id];
         const RouteSnapshot snapshot = route.ReadSnapshot();
         ScopedCameraLogContext log_context(static_cast<int>(camera_id));
-        const bool route_unavailable = snapshot.state == CameraRunState::kReconnecting ||
+        const bool route_unavailable = snapshot.state == CameraRunState::kResynchronizing ||
+                                       snapshot.state == CameraRunState::kReconnecting ||
                                        snapshot.state == CameraRunState::kFailed ||
                                        snapshot.state == CameraRunState::kStarting ||
                                        snapshot.state == CameraRunState::kReady;
@@ -4382,6 +4635,7 @@ int Run(const Options& options) {
             LogError("[FINAL] decode validation failed: state=%s decoded_frames=%llu "
                      "vdec_errors=%llu vdec_stream_errors=%llu vdec_hw_errors=%llu "
                      "vdec_current_hw_errors=%llu ffmpeg_errors=%llu corrupt_packets=%llu "
+                     "invalid_h264_packets=%llu resync_generation=%llu "
                      "recoverable_rtsp_errors=%llu fatal_ffmpeg_errors=%llu "
                      "pending_recovery_errors=%llu recovered_ffmpeg_errors=%llu "
                      "recovery_attempts=%llu recovery_successes=%llu recovery_failures=%llu",
@@ -4394,6 +4648,8 @@ int Run(const Options& options) {
                          snapshot.vdec.current_hardware_decode_errors),
                      static_cast<unsigned long long>(snapshot.ffmpeg_errors),
                      static_cast<unsigned long long>(snapshot.corrupt_packets),
+                     static_cast<unsigned long long>(snapshot.invalid_h264_packets),
+                     static_cast<unsigned long long>(snapshot.resync_generation),
                      static_cast<unsigned long long>(snapshot.recoverable_rtsp_errors),
                      static_cast<unsigned long long>(snapshot.fatal_ffmpeg_errors),
                      static_cast<unsigned long long>(snapshot.pending_recovery_errors),
