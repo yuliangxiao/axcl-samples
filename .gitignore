@@ -53,6 +53,9 @@ build*/
 *.egg-info/
 __pycache__/
 
+# Local test credentials and machine-specific configuration.
+.env.local
+
 
 # msp
 out*/
