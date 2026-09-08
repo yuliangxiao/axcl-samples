@@ -129,17 +129,18 @@ build-win\examples\axcl\axcl_yolo26.exe -m D:\models\yolo26n.axmodel -s "rtsp://
 
 程序不保存结果图片或视频，也不创建 `output` 目录。模型加载、AXCL 初始化及 5 次预热不计入正式统计。启动日志会隐藏 RTSP 密码，但默认地址仍以明文存在于源码中。
 
-## Windows 原生 RTSP 硬解码 + YOLO26
+## Windows 原生 RTSP/本地文件硬解码 + YOLO26
 
 `ax_yolo26_rtsp_native.exe` 是独立目标，不改变上面的 `axcl_yolo26`。它提供三个运行模式：
 
-- `vdec-smoke`：FFmpeg `libavformat` RTSP 解封装 → AXCL Native VDEC；
+- `vdec-smoke`：FFmpeg `libavformat` RTSP、MP4/MOV 或 MPEG-PS 解封装 → AXCL Native VDEC；
 - `ivps-smoke`：VDEC NV12 → AXCL Native IVPS 640×640 BGR，黑色居中 letterbox；
 - `infer`：四路 IVPS 分别写入自己的 CMM（连续媒体内存）最新帧槽，单推理线程将选中帧 D2D
   （设备到设备）复制到 `ax_runner_axcl` 固定输入，再执行 YOLO26 和 CPU 后处理。
 
 三种模式共用同一套运行期单路 RTSP/VDEC 有界恢复和最终退出判定；初次启动时任一路打开失败仍不重试，
-直接完成清理并返回 `-1`。
+直接完成清理并返回 `-1`。本地文件的正常 EOF（文件结束）不属于故障：程序立即重开文件、保留现有 VDEC
+Group，并从下一个 IDR（即时解码刷新）帧开始下一轮。
 
 该目标默认不参与构建，避免没有 FFmpeg 开发包时影响已有示例。以下命令均在 Visual Studio 2022 Developer Command Prompt（开发者命令提示符）中执行。
 
@@ -150,7 +151,7 @@ cd /d D:\axcl-samples
 set "PATH=D:\ninja-win;D:\AXCL\axcl\out\axcl_win_x64\bin;D:\AXCL\axcl\3rdparty\ffmpeg\win64\lib;D:\opencv\opencv\build\x64\vc16\bin;%PATH%"
 ```
 
-配置并只编译原生 RTSP 目标：
+配置并只编译原生 RTSP/本地文件目标：
 
 ```cmd
 cmake -S . -B build-native -G Ninja -DCMAKE_BUILD_TYPE=Release -DAXCL_DIR=D:\AXCL\axcl\out\axcl_win_x64 -DFFMPEG_DIR=D:\AXCL\axcl\3rdparty\ffmpeg\win64 -DOpenCV_DIR=D:\opencv\opencv\build\x64\vc16\lib -DAXCL_BUILD_YOLO26_RTSP_NATIVE=ON
@@ -165,16 +166,25 @@ cmake --build build-native --target ax_yolo26_rtsp_native -j 4
 build-native\examples\axcl\ax_yolo26_rtsp_native.exe
 ```
 
-原生目标与上面的 OpenCV 目标共享默认模型路径和 RTSP 地址。无参数启动时默认进入 `infer` 模式，
-并使用同一个地址建立四条独立 RTSP 连接；RTSP 服务端必须允许同一地址同时连接四次：
+原生目标沿用默认模型路径。无参数启动时默认进入 `infer` 模式，读取固定的 H.264、2560×1440 文件
+`D:\test.mp4`，并将它复制给四条独立解码与识别管线。该文件支持 MP4/MOV 和 MPEG-PS 封装；程序按
+内容识别容器，不依赖 `.mp4` 后缀。文件按 DTS（解码时间戳）原速读取，PTS
+（显示时间戳）跨循环保持递增，EOF 后持续从头循环；Linux 构建的对应默认路径为 `test.mp4`：
 
 ```cmd
 build-native\examples\axcl\ax_yolo26_rtsp_native.exe
 ```
 
-也可以通过 `--model`/`-m` 和 `--source`/`-s` 覆盖默认值。`--source` 仍只接收一个地址，程序会将
-它复制给 `camera=0～3`。下列命令中的 RTSP URL 只作为覆盖格式示例，请替换为实际地址。程序日志会
-隐藏密码，但共享默认地址仍以明文存在于 `examples\axcl\yolo26_defaults.hpp` 中。
+`--model`/`-m` 可以覆盖模型路径。显式传入 `--source`/`-s` 时切换到 RTSP，参数必须是
+`rtsp://` 或 `rtsps://` URL；程序仍将唯一地址复制给 `camera=0～3`，RTSP 服务端必须允许同一地址
+同时连接四次：
+
+```cmd
+build-native\examples\axcl\ax_yolo26_rtsp_native.exe --source "rtsp://user:password@192.168.0.201:554/Streaming/Channels/101"
+```
+
+日志会隐藏 URL 中的密码。未显式传入 `--source` 时不会使用
+`examples\axcl\yolo26_defaults.hpp` 中的默认 RTSP 地址。
 
 程序通过命令行正常启动后，会在当前工作目录的 `log` 文件夹中创建独立日志文件，命名格式为
 `ax_yolo26_rtsp_native_日期_时间_毫秒_pid进程号.log`。应用日志统一带本地毫秒时间戳；逐帧
@@ -190,6 +200,18 @@ build-native\examples\axcl\ax_yolo26_rtsp_native.exe
 码流故障共用该路预算。警告和错误会立即同时写入日志与控制台；
 `--help` 和参数错误直接显示在控制台，不创建运行日志。日志目录或文件创建失败时，程序会在控制台报错
 并停止运行。可用 `--stats-interval` 修改统计间隔，默认值为 `1` 秒。
+
+`infer` 模式默认不保存检测图片，也不会创建图片目录、执行全分辨率截图或启动 JPEG 写入线程。显式传入
+`--save-images` 后才启用原有保存流程；Windows 默认目录为 `D:\Images`，Linux 默认为当前目录下的
+`Images`，可用 `--image-dir` 覆盖，目录不存在时自动创建。启用后，每路健康管线约每秒选择一张与实际
+推理严格配对的 2560×1440 原图，绘制检测框、类别、置信度、路号、本地时间和目标数后，以质量 90 的
+JPEG 保存。文件名包含路号、本地日期时间、毫秒、PID（进程号）和进程内唯一帧号；若仍发生碰撞则追加
+序号，并使用排他创建避免覆盖旧文件。四路每小时会产生约 14400 个文件，程序不会自动删除历史图片。
+
+启用保存后，为保证框与画面属于同一帧，需要截图的 latest-frame（最新帧）槽在共享推理线程领取前
+不会被后续候选覆盖；只有该帧额外通过 IVPS 生成全分辨率 BGR 并执行 D2H（设备到主机）回读，四路
+每秒各一张时原始回读量约为 42 MiB/s。JPEG 编码和落盘由容量 8 的独立有界队列处理；队列积压、单张
+编码或写入失败会记录警告或错误并丢弃对应图片，但不会中断识别。输出目录无法创建时属于启动错误。
 
 完整推理模式会在推理启动满 10 秒后监测每路滚动 10 秒推理 FPS。低于 `10` 时输出性能警告但继续
 运行：进入低帧率状态时立即提示，持续异常最多每 30 秒重复一次，恢复后提示一次。单路处于
@@ -209,7 +231,8 @@ Linux 不启用退出暂停。
 `send_max_ms`、`latest_replacements`、`vdec_stream_errors`、`last_error_code`、
 `corrupt_packets`、`invalid_h264_packets`、`resync_generation`、`recoverable_rtsp_errors`、
 `fatal_ffmpeg_errors`、`pending_recovery_errors`、`recovery_attempts`、`recovery_successes`、
-`recovery_failures`、`recovered_ffmpeg_errors` 和 `recovery_downtime_ms` 等累计指标；其中 `ffmpeg_errors` 是
+`recovery_failures`、`recovered_ffmpeg_errors`、`recovery_downtime_ms`、`file_loops`、
+`snapshot_frames` 和 `snapshot_errors` 等累计指标；其中 `ffmpeg_errors` 是
 FFmpeg 累计诊断数，不直接决定退出码，
 `recovery_attempts/successes/failures` 也是进程生命周期累计值，不充当或重置当前三次预算。
 `invalid_h264_packets` 专门统计本地 H.264 结构校验发现并丢弃的包；`resync_generation` 供性能监测丢弃
@@ -225,6 +248,8 @@ FFmpeg 累计诊断数，不直接决定退出码，
 丢弃后等待下一个
 IDR（即时解码刷新）关键帧，不立即重连。每次可恢复 RTSP 事件立即计入 `recoverable_rtsp_errors` 和待确认数；
 首个健康画面出现时，待确认数转入 `recovered_ffmpeg_errors`。已恢复的历史错误和损坏包不影响健康退出。
+本地文件 EOF 是正常循环边界，不增加 FFmpeg 错误、恢复尝试或待确认错误；本地文件打不开、容器不是
+MP4/MOV 或 MPEG-PS、编码不是 H.264、分辨率不是 2560×1440，或循环重开失败时直接协调停止四路。
 
 > **运行期 H.264 包级重同步**：输入会话成功打开后（包括首个 IDR 到达前），运行期包未设置
 > `AV_PKT_FLAG_CORRUPT`，但本地校验发现空包、非 Annex-B、无有效
@@ -315,7 +340,20 @@ build-native\examples\axcl\ax_yolo26_rtsp_native.exe --mode ivps-smoke --duratio
 模型默认沿用 `D:\yolo26\yolo26m.axmodel`，也可以用 `--model` 覆盖：
 
 ```cmd
+build-native\examples\axcl\ax_yolo26_rtsp_native.exe --mode infer --duration 60 --model "D:\yolo26\yolo26m.axmodel"
+```
+
+上例使用默认 `D:\test.mp4`。切换到 RTSP 时显式增加 `--source`：
+
+```cmd
 build-native\examples\axcl\ax_yolo26_rtsp_native.exe --mode infer --duration 60 --model "D:\yolo26\yolo26m.axmodel" --source "rtsp://user:password@192.168.0.201:554/Streaming/Channels/101"
+```
+
+以上命令默认不保存图片。如需启用原有图片保存流程，增加 `--save-images`；还可同时用 `--image-dir`
+指定保存目录：
+
+```cmd
+build-native\examples\axcl\ax_yolo26_rtsp_native.exe --mode infer --duration 60 --model "D:\yolo26\yolo26m.axmodel" --save-images --image-dir "D:\Images"
 ```
 
 验收条件：
@@ -324,13 +362,17 @@ build-native\examples\axcl\ax_yolo26_rtsp_native.exe --mode infer --duration 60 
 - 每路候选上限为 11 FPS，推理启动满 10 秒后的滚动 10 秒 `infer_fps` 应不低于 10，且四路公平调度；
   如果单推理实例不足以处理约 44 FPS，旧候选帧会被最新帧覆盖而不积压；
 - 四路 `infer_frames` 均持续增加、`infer_errors=0`，日志中的每条 `[DETECTION]` 都包含 `camera=0～3`；
+- 默认启动日志包含 `image_saving=disabled`，且不创建图片目录；传入 `--save-images` 后，`D:\Images`
+  中每路约每秒产生一张 2560×1440 JPEG，`snapshot_frames` 持续增加，正常磁盘负载下保存线程的
+  `dropped/errors` 应为 0；
 - VDEC 致命错误、当前硬件错误、`fatal_ffmpeg_errors` 和 IVPS 错误计数仍为 0；允许历史
   `vdec_stream_errors`、`recoverable_rtsp_errors`、`corrupt_packets`、`invalid_h264_packets` 和
   `ffmpeg_errors` 非零；
 - 正式链路没有 Host 视频解码、resize、CSC 或 NPU 输入 H2D（主机到设备）复制；每个候选帧只执行
-  一次约 1.2 MB 的设备内 D2D 复制。
+  一次约 1.2 MB 的设备内 D2D。默认不执行截图 D2H；传入 `--save-images` 后，每路每秒选中的截图帧
+  会额外执行一次全分辨率 IVPS CSC 和约 10.55 MiB D2H，其他候选帧不回读原图。
 
-首版固定为四路、H.264、2560×1440、RTSP over TCP。四条连接各自使用一个解码线程、Runtime Context
+当前实现固定为四路、H.264、2560×1440，支持默认 MP4/MOV 或 MPEG-PS 本地文件循环，以及显式 RTSP over TCP。四条管线各自使用一个解码线程、Runtime Context
 （运行时上下文）、VDEC Group 和 IVPS 最新帧槽；四路共享一个模型和一个推理线程。每路使用固定单调
 时间轴限制为最多 11 FPS，四路相位按约 90.909 ms 的周期均匀错开；错过的节拍直接跳过，只处理最新帧，
 不补做历史帧。运行期已分类的 RTSP 传输故障与 `AX_ERR_VDEC_STRM_ERROR` 按上述共享预算执行单路重建；

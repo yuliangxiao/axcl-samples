@@ -18,6 +18,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cerrno>
 #include <csignal>
 #include <condition_variable>
@@ -100,6 +101,8 @@ constexpr int kInputHeight = 640;
 constexpr int kInputChannels = 3;
 constexpr std::size_t kInputStride = static_cast<std::size_t>(kInputWidth) * kInputChannels;
 constexpr std::size_t kInputBytes = kInputStride * kInputHeight;
+constexpr std::size_t kSnapshotStride = static_cast<std::size_t>(kSourceWidth) * kInputChannels;
+constexpr std::size_t kSnapshotBytes = kSnapshotStride * kSourceHeight;
 constexpr int kModelGroupId = 0;
 constexpr int kWarmupCount = 5;
 constexpr int kClassCount = 80;
@@ -123,8 +126,73 @@ constexpr std::chrono::seconds kIdrResyncWarningRepeat{30};
 constexpr std::uint32_t kCameraRecoveryMaxAttempts = 3;
 constexpr std::chrono::seconds kCameraRecoveryRetryDelay{30};
 constexpr std::chrono::seconds kCameraRecoveryStableWindow{30};
+constexpr std::chrono::seconds kSnapshotPeriod{1};
+constexpr std::size_t kSnapshotQueueCapacity = 8;
+constexpr int kSnapshotJpegQuality = 90;
+constexpr std::chrono::milliseconds kPlaybackLateReanchorThreshold{500};
 constexpr AX_S32 kAxclRuntimeTaskTimeout =
     AXCL_DEF_RUNTIME_ERR(AXCL_RUNTIME_TASK, AXCL_ERR_TIMEOUT);
+
+#ifdef _WIN32
+constexpr char kDefaultMp4Path[] = R"(D:\test.mp4)";
+constexpr char kDefaultImageDirectory[] = R"(D:\Images)";
+#else
+constexpr char kDefaultMp4Path[] = "test.mp4";
+constexpr char kDefaultImageDirectory[] = "Images";
+#endif
+
+constexpr std::array<const char*, kClassCount> kClassNames{{
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck",
+    "boat", "traffic light", "fire hydrant", "stop sign", "parking meter", "bench",
+    "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra",
+    "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
+    "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove",
+    "skateboard", "surfboard", "tennis racket", "bottle", "wine glass", "cup", "fork",
+    "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange", "broccoli",
+    "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch", "potted plant",
+    "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard",
+    "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator", "book",
+    "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush"}};
+
+enum class InputKind {
+    kRtsp,
+    kLocalFile,
+};
+
+const char* InputKindName(InputKind kind) {
+    return kind == InputKind::kRtsp ? "RTSP" : "FILE";
+}
+
+bool IsRtspUrl(const std::string& source) {
+    return source.rfind("rtsp://", 0) == 0 || source.rfind("rtsps://", 0) == 0;
+}
+
+bool DemuxerHasName(const char* names, const char* expected) {
+    if (names == nullptr || expected == nullptr) {
+        return false;
+    }
+    const std::size_t expected_size = std::strlen(expected);
+    const char* token = names;
+    while (*token != '\0') {
+        const char* end = std::strchr(token, ',');
+        const std::size_t token_size =
+            end == nullptr ? std::strlen(token) : static_cast<std::size_t>(end - token);
+        if (token_size == expected_size &&
+            std::strncmp(token, expected, expected_size) == 0) {
+            return true;
+        }
+        if (end == nullptr) {
+            break;
+        }
+        token = end + 1;
+    }
+    return false;
+}
+
+bool IsSupportedLocalFileDemuxer(const char* names) {
+    return DemuxerHasName(names, "mov") || DemuxerHasName(names, "mp4") ||
+           DemuxerHasName(names, "mpeg");
+}
 
 enum class ApplicationLogLevel {
     kInfo,
@@ -151,19 +219,24 @@ const char* ApplicationLogLevelName(ApplicationLogLevel level) {
     return "UNKNOWN";
 }
 
-std::string WallClockTimestamp() {
-    const auto now = std::chrono::system_clock::now();
-    const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                  now.time_since_epoch()) %
-                              1000;
-    const std::time_t now_time = std::chrono::system_clock::to_time_t(now);
-    std::tm local_time{};
+bool ToLocalTime(std::chrono::system_clock::time_point time, std::tm* local_time) {
+    if (local_time == nullptr) {
+        return false;
+    }
+    const std::time_t value = std::chrono::system_clock::to_time_t(time);
 #ifdef _WIN32
-    const bool converted = localtime_s(&local_time, &now_time) == 0;
+    return localtime_s(local_time, &value) == 0;
 #else
-    const bool converted = localtime_r(&now_time, &local_time) != nullptr;
+    return localtime_r(&value, local_time) != nullptr;
 #endif
-    if (!converted) {
+}
+
+std::string WallClockTimestampAt(std::chrono::system_clock::time_point time) {
+    const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  time.time_since_epoch()) %
+                              1000;
+    std::tm local_time{};
+    if (!ToLocalTime(time, &local_time)) {
         return "0000-00-00 00:00:00.000";
     }
 
@@ -174,6 +247,28 @@ std::string WallClockTimestamp() {
 
     char timestamp[40]{};
     std::snprintf(timestamp, sizeof(timestamp), "%s.%03lld", date_time,
+                  static_cast<long long>(milliseconds.count()));
+    return timestamp;
+}
+
+std::string WallClockTimestamp() {
+    return WallClockTimestampAt(std::chrono::system_clock::now());
+}
+
+std::string FileTimestampAt(std::chrono::system_clock::time_point time) {
+    const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  time.time_since_epoch()) %
+                              1000;
+    std::tm local_time{};
+    if (!ToLocalTime(time, &local_time)) {
+        return "00000000_000000_000";
+    }
+    char date_time[24]{};
+    if (std::strftime(date_time, sizeof(date_time), "%Y%m%d_%H%M%S", &local_time) == 0) {
+        return "00000000_000000_000";
+    }
+    char timestamp[32]{};
+    std::snprintf(timestamp, sizeof(timestamp), "%s_%03lld", date_time,
                   static_cast<long long>(milliseconds.count()));
     return timestamp;
 }
@@ -620,10 +715,13 @@ enum class RunMode {
 
 struct Options {
     RunMode mode{RunMode::kInfer};
-    std::string source{yolo26_defaults::kRtspSource};
+    InputKind input_kind{InputKind::kLocalFile};
+    std::string source{kDefaultMp4Path};
     std::string model{yolo26_defaults::kModelPath};
     std::string axcl_config;
     std::string dump_ivps;
+    std::string image_directory{kDefaultImageDirectory};
+    bool save_images{false};
     int device_index{0};
     int duration_seconds{0};
     int read_timeout_ms{5000};
@@ -855,12 +953,134 @@ H264NalSummary InspectAnnexBNals(const std::uint8_t* data, std::size_t size) {
 struct AccessUnit {
     std::vector<std::uint8_t> data;
     std::uint64_t pts_us{0};
+    std::uint64_t pace_us{0};
+    std::uint64_t duration_us{0};
     H264NalSummary nals{};
+};
+
+class FilePlaybackClock final {
+public:
+    void Reset(Clock::time_point wall_anchor) {
+        wall_anchor_ = wall_anchor;
+        loop_offset_us_ = 0;
+        loop_span_us_ = 0;
+        loop_origin_us_ = 0;
+        last_relative_pace_us_ = 0;
+        loop_started_ = false;
+        loop_has_frame_ = false;
+        last_reanchor_warning_ = Clock::time_point{};
+    }
+
+    bool CompleteLoop() {
+        if (!loop_has_frame_ || loop_span_us_ == 0) {
+            LogError("[PLAYBACK] local file loop reached EOF without an accepted H.264 frame");
+            return false;
+        }
+        if (loop_offset_us_ > std::numeric_limits<std::uint64_t>::max() - loop_span_us_) {
+            LogError("[PLAYBACK] cumulative local file timeline overflow");
+            return false;
+        }
+        loop_offset_us_ += loop_span_us_;
+        loop_span_us_ = 0;
+        loop_origin_us_ = 0;
+        last_relative_pace_us_ = 0;
+        loop_started_ = false;
+        loop_has_frame_ = false;
+        return true;
+    }
+
+    bool Pace(AccessUnit* access_unit, const std::atomic<bool>* stop_requested) {
+        if (access_unit == nullptr || wall_anchor_ == Clock::time_point{}) {
+            LogError("[PLAYBACK] invalid local file playback clock state");
+            return false;
+        }
+        if (!loop_started_) {
+            loop_origin_us_ = access_unit->pace_us;
+            loop_started_ = true;
+        }
+
+        std::uint64_t relative_pace_us = access_unit->pace_us >= loop_origin_us_
+                                             ? access_unit->pace_us - loop_origin_us_
+                                             : 0;
+        if (relative_pace_us < last_relative_pace_us_) {
+            relative_pace_us = last_relative_pace_us_;
+        }
+        const std::uint64_t relative_pts_us = access_unit->pts_us >= loop_origin_us_
+                                                  ? access_unit->pts_us - loop_origin_us_
+                                                  : 0;
+        if (loop_offset_us_ > std::numeric_limits<std::uint64_t>::max() - relative_pts_us ||
+            loop_offset_us_ > std::numeric_limits<std::uint64_t>::max() - relative_pace_us) {
+            LogError("[PLAYBACK] local file access-unit timeline overflow");
+            return false;
+        }
+        access_unit->pts_us = loop_offset_us_ + relative_pts_us;
+        const std::uint64_t scheduled_us = loop_offset_us_ + relative_pace_us;
+        if (scheduled_us > static_cast<std::uint64_t>(
+                               std::numeric_limits<std::int64_t>::max())) {
+            LogError("[PLAYBACK] local file wall-clock deadline overflow");
+            return false;
+        }
+
+        const std::uint64_t frame_start_us =
+            std::max(relative_pace_us, relative_pts_us);
+        if (access_unit->duration_us >
+            std::numeric_limits<std::uint64_t>::max() - frame_start_us) {
+            LogError("[PLAYBACK] local file frame-duration timeline overflow");
+            return false;
+        }
+        const std::uint64_t frame_end_us = frame_start_us + access_unit->duration_us;
+        loop_span_us_ = std::max(loop_span_us_, frame_end_us);
+        last_relative_pace_us_ = relative_pace_us;
+        loop_has_frame_ = true;
+
+        auto target = wall_anchor_ +
+                      std::chrono::microseconds(static_cast<std::int64_t>(scheduled_us));
+        auto now = Clock::now();
+        if (now > target + kPlaybackLateReanchorThreshold) {
+            const double late_ms = ElapsedMilliseconds(target, now);
+            wall_anchor_ += now - target;
+            target = now;
+            if (last_reanchor_warning_ == Clock::time_point{} ||
+                now - last_reanchor_warning_ >= kLowInferenceWarningRepeat) {
+                LogWarning("[PLAYBACK] local file reader was late by %.3fms; wall clock re-anchored",
+                           late_ms);
+                last_reanchor_warning_ = now;
+            }
+        }
+
+        constexpr auto kStopPollInterval = std::chrono::milliseconds(10);
+        while (Clock::now() < target) {
+            if (stop_requested != nullptr &&
+                stop_requested->load(std::memory_order_relaxed)) {
+                return false;
+            }
+            const auto remaining = target - Clock::now();
+            if (remaining <= Clock::duration::zero()) {
+                break;
+            }
+            std::this_thread::sleep_for(std::min(
+                remaining,
+                std::chrono::duration_cast<Clock::duration>(kStopPollInterval)));
+        }
+        return stop_requested == nullptr ||
+               !stop_requested->load(std::memory_order_relaxed);
+    }
+
+private:
+    Clock::time_point wall_anchor_{};
+    Clock::time_point last_reanchor_warning_{};
+    std::uint64_t loop_offset_us_{0};
+    std::uint64_t loop_span_us_{0};
+    std::uint64_t loop_origin_us_{0};
+    std::uint64_t last_relative_pace_us_{0};
+    bool loop_started_{false};
+    bool loop_has_frame_{false};
 };
 
 enum class RtspIoStatus {
     kSuccess,
     kResynchronizing,
+    kLoopBoundary,
     kRecoverableFailure,
     kFatalFailure,
     kInterrupted,
@@ -1032,14 +1252,18 @@ public:
         Close();
     }
 
-    RtspOpenResult Open(const std::string& source, int timeout_ms) try {
+    RtspOpenResult Open(const std::string& source, InputKind input_kind,
+                        int timeout_ms) try {
         Close();
+        input_kind_ = input_kind;
         annex_b_parameter_sets_.clear();
         pre_idr_parameter_sets_.clear();
         bitstream_mode_.clear();
         synthetic_pts_us_ = 0;
+        synthetic_pace_us_ = 0;
         reported_fps_ = 0.0;
         waiting_for_idr_ = true;
+        bsf_flush_sent_ = false;
         timeout_us_ = static_cast<std::int64_t>(timeout_ms) * 1000;
         format_ = avformat_alloc_context();
         if (format_ == nullptr) {
@@ -1059,16 +1283,19 @@ public:
                 }
             }
         } options_guard{&options};
-        int option_ret = av_dict_set(&options, "rtsp_transport", "tcp", 0);
+        int option_ret = 0;
+        if (input_kind_ == InputKind::kRtsp) {
+            option_ret = av_dict_set(&options, "rtsp_transport", "tcp", 0);
 #if LIBAVFORMAT_VERSION_MAJOR >= 59
-        if (option_ret >= 0) {
-            option_ret = av_dict_set_int(&options, "timeout", timeout_us_, 0);
-        }
+            if (option_ret >= 0) {
+                option_ret = av_dict_set_int(&options, "timeout", timeout_us_, 0);
+            }
 #else
-        if (option_ret >= 0) {
-            option_ret = av_dict_set_int(&options, "stimeout", timeout_us_, 0);
-        }
+            if (option_ret >= 0) {
+                option_ret = av_dict_set_int(&options, "stimeout", timeout_us_, 0);
+            }
 #endif
+        }
         if (option_ret < 0) {
             LogError("[FFMPEG] input option allocation failed: %s (%d)",
                      AvErrorText(option_ret).c_str(), option_ret);
@@ -1077,7 +1304,7 @@ public:
             return RecordOpenFailure(RtspFailureReason::kOutOfMemory, option_ret, false);
         }
 
-        ArmDeadline(interrupt_, timeout_us_);
+        ArmDeadline(interrupt_, input_kind_ == InputKind::kRtsp ? timeout_us_ : 0);
         const int open_ret = avformat_open_input(&format_, source.c_str(), nullptr, &options);
         const bool open_stopped = StopRequested();
         const bool open_timed_out = DeadlineExpired();
@@ -1108,7 +1335,7 @@ public:
                                      AVERROR(EINVAL), false);
         }
 
-        ArmDeadline(interrupt_, timeout_us_);
+        ArmDeadline(interrupt_, input_kind_ == InputKind::kRtsp ? timeout_us_ : 0);
         const int info_ret = avformat_find_stream_info(format_, nullptr);
         const bool info_stopped = StopRequested();
         const bool info_timed_out = DeadlineExpired();
@@ -1152,8 +1379,12 @@ public:
         }
 
         const char* demuxer_name = format_->iformat == nullptr ? nullptr : format_->iformat->name;
-        if (demuxer_name == nullptr || std::strcmp(demuxer_name, "rtsp") != 0) {
-            LogError("[FFMPEG] input is not handled by the RTSP demuxer: %s",
+        const bool expected_demuxer = input_kind_ == InputKind::kRtsp
+                                          ? DemuxerHasName(demuxer_name, "rtsp")
+                                          : IsSupportedLocalFileDemuxer(demuxer_name);
+        if (!expected_demuxer) {
+            LogError("[FFMPEG] %s input uses unsupported demuxer: %s",
+                     InputKindName(input_kind_),
                      demuxer_name == nullptr ? "<null>" : demuxer_name);
             Close();
             return RecordOpenFailure(RtspFailureReason::kUnsupportedInput,
@@ -1182,7 +1413,7 @@ public:
                                              AVERROR_INVALIDDATA, false);
                 }
                 annex_b_parameter_sets_.assign(extra, extra + extra_size);
-                bitstream_mode_ = "annex-b (RTSP/SDP)";
+                bitstream_mode_ = "annex-b (input extradata)";
             } else if (codec->extradata_size >= 7 && codec->extradata[0] == 1) {
                 const int bsf_ret = InitializeMp4ToAnnexB();
                 if (bsf_ret < 0) {
@@ -1198,19 +1429,24 @@ public:
                                          AVERROR_INVALIDDATA, false);
             }
         } else {
-            bitstream_mode_ = "annex-b (no SDP parameter sets)";
+            bitstream_mode_ = "annex-b (no extradata parameter sets)";
         }
 
         const AVRational guessed_rate = av_guess_frame_rate(format_, stream_, nullptr);
         reported_fps_ = guessed_rate.num > 0 && guessed_rate.den > 0 ? av_q2d(guessed_rate) : 0.0;
-        LogInfo("[FFMPEG] opened RTSP over TCP: stream=%d codec=H264 size=%dx%d fps=%.3f time_base=%d/%d",
-                video_stream_index_, codec->width, codec->height, reported_fps_, stream_->time_base.num,
-                stream_->time_base.den);
+        LogInfo("[FFMPEG] opened %s input%s: stream=%d codec=H264 size=%dx%d fps=%.3f "
+                "time_base=%d/%d demuxer=%s",
+                InputKindName(input_kind_),
+                input_kind_ == InputKind::kRtsp ? " over TCP" : "",
+                video_stream_index_, codec->width, codec->height, reported_fps_,
+                stream_->time_base.num, stream_->time_base.den,
+                demuxer_name == nullptr ? "<null>" : demuxer_name);
         LogInfo("[FFMPEG] bitstream mode: %s; explicit decoder APIs: disabled",
                 bitstream_mode_.c_str());
         return {RtspIoStatus::kSuccess, RtspFailureReason::kNone, 0};
     } catch (const std::bad_alloc&) {
-        LogError("[FFMPEG] memory allocation failed while opening RTSP input");
+        LogError("[FFMPEG] memory allocation failed while opening %s input",
+                 InputKindName(input_kind_));
         Close();
         return RecordOpenFailure(RtspFailureReason::kOutOfMemory,
                                  AVERROR(ENOMEM), false);
@@ -1224,11 +1460,12 @@ public:
             return RecordReadFailure(RtspFailureReason::kInvalidState,
                                      AVERROR(EINVAL), false);
         }
-        const std::int64_t deadline_us = resync_active_
-                                             ? resync_deadline_us_
-                                             : timeout_us > 0
-                                                   ? av_gettime_relative() + timeout_us
-                                                   : 0;
+        const std::int64_t deadline_us =
+            resync_active_
+                ? resync_deadline_us_
+                : input_kind_ == InputKind::kRtsp && timeout_us > 0
+                      ? av_gettime_relative() + timeout_us
+                      : 0;
 
         while (true) {
             if (StopRequested()) {
@@ -1247,6 +1484,10 @@ public:
                 if (receive_ret == 0) {
                     output = filtered_packet_;
                     output_time_base = bsf_->time_base_out;
+                } else if (receive_ret == AVERROR_EOF && bsf_flush_sent_ &&
+                           input_kind_ == InputKind::kLocalFile) {
+                    return {RtspIoStatus::kLoopBoundary,
+                            RtspFailureReason::kEndOfStream, receive_ret};
                 } else if (receive_ret == AVERROR_EOF) {
                     LogError("[FFMPEG] bitstream filter reached unexpected EOF");
                     return RecordReadFailure(RtspFailureReason::kBitstreamFilter,
@@ -1261,6 +1502,17 @@ public:
 
             if (output == nullptr) {
                 const RtspReadResult input_result = ReadSelectedPacket(deadline_us);
+                if (input_result.status == RtspIoStatus::kLoopBoundary && bsf_ != nullptr) {
+                    const int flush_ret = av_bsf_send_packet(bsf_, nullptr);
+                    if (flush_ret < 0 && flush_ret != AVERROR_EOF) {
+                        LogError("[FFMPEG] av_bsf_send_packet(flush) failed: %s (%d)",
+                                 AvErrorText(flush_ret).c_str(), flush_ret);
+                        return RecordReadFailure(RtspFailureReason::kBitstreamFilter,
+                                                 flush_ret, false);
+                    }
+                    bsf_flush_sent_ = true;
+                    continue;
+                }
                 if (input_result.status != RtspIoStatus::kSuccess) {
                     return input_result;
                 }
@@ -1326,6 +1578,7 @@ public:
         resync_deadline_us_ = 0;
         resync_started_ = Clock::time_point{};
         resync_dropped_packets_ = 0;
+        bsf_flush_sent_ = false;
     }
 
     std::uint64_t input_packets() const { return input_packets_; }
@@ -1491,6 +1744,9 @@ private:
             return {RtspIoStatus::kInterrupted,
                     RtspFailureReason::kStopRequested, error};
         }
+        if (input_kind_ == InputKind::kLocalFile) {
+            return RecordOpenFailure(RtspFailureReason::kInvalidInput, error, false);
+        }
         if (timed_out) {
             return RecordOpenFailure(RtspFailureReason::kTimeout, error, true);
         }
@@ -1565,6 +1821,12 @@ private:
                         RtspFailureReason::kStopRequested, ret};
             }
             if (ret == AVERROR_EOF) {
+                av_packet_unref(packet_);
+                if (input_kind_ == InputKind::kLocalFile) {
+                    LogInfo("[FFMPEG] local file input reached EOF; preparing next loop");
+                    return {RtspIoStatus::kLoopBoundary,
+                            RtspFailureReason::kEndOfStream, ret};
+                }
                 LogError("[FFMPEG] RTSP stream reached EOF");
                 return RecordReadFailure(RtspFailureReason::kEndOfStream, ret, true);
             }
@@ -1588,7 +1850,8 @@ private:
                              AvErrorText(ret).c_str(), ret);
                     return RecordReadFailure(RtspFailureReason::kInvalidInput, ret, false);
                 }
-                if (IsRecoverableRtspTransportError(ret)) {
+                if (input_kind_ == InputKind::kRtsp &&
+                    IsRecoverableRtspTransportError(ret)) {
                     LogError("[FFMPEG] av_read_frame recoverable transport failure: %s (%d)",
                              AvErrorText(ret).c_str(), ret);
                     return RecordReadFailure(RtspFailureReason::kNetworkIo, ret, true);
@@ -1711,7 +1974,6 @@ private:
             }
         }
 
-        const std::int64_t packet_ts = packet.pts != AV_NOPTS_VALUE ? packet.pts : packet.dts;
         std::uint64_t duration_us = 0;
         if (packet.duration > 0) {
             const auto converted = av_rescale_q(packet.duration, time_base, AV_TIME_BASE_Q);
@@ -1723,14 +1985,29 @@ private:
         if (duration_us == 0) {
             duration_us = 33333;
         }
+        access_unit->duration_us = duration_us;
 
-        if (packet_ts != AV_NOPTS_VALUE) {
-            const auto converted = av_rescale_q(packet_ts, time_base, AV_TIME_BASE_Q);
+        const std::int64_t display_ts =
+            packet.pts != AV_NOPTS_VALUE ? packet.pts : packet.dts;
+        if (display_ts != AV_NOPTS_VALUE) {
+            const auto converted = av_rescale_q(display_ts, time_base, AV_TIME_BASE_Q);
             access_unit->pts_us = converted >= 0 ? static_cast<std::uint64_t>(converted) : 0;
             synthetic_pts_us_ = std::max(synthetic_pts_us_, access_unit->pts_us + duration_us);
         } else {
             access_unit->pts_us = synthetic_pts_us_;
             synthetic_pts_us_ += duration_us;
+        }
+
+        const std::int64_t pace_ts =
+            packet.dts != AV_NOPTS_VALUE ? packet.dts : packet.pts;
+        if (pace_ts != AV_NOPTS_VALUE) {
+            const auto converted = av_rescale_q(pace_ts, time_base, AV_TIME_BASE_Q);
+            access_unit->pace_us = converted >= 0 ? static_cast<std::uint64_t>(converted) : 0;
+            synthetic_pace_us_ =
+                std::max(synthetic_pace_us_, access_unit->pace_us + duration_us);
+        } else {
+            access_unit->pace_us = synthetic_pace_us_;
+            synthetic_pace_us_ += duration_us;
         }
         return BuildAccessUnitResult::kAccepted;
     }
@@ -1741,6 +2018,7 @@ private:
     AVBSFContext* bsf_{nullptr};
     AVPacket* packet_{nullptr};
     AVPacket* filtered_packet_{nullptr};
+    InputKind input_kind_{InputKind::kRtsp};
     int video_stream_index_{-1};
     std::int64_t timeout_us_{0};
     std::string bitstream_mode_;
@@ -1755,6 +2033,7 @@ private:
     std::uint64_t fatal_errors_{0};
     std::uint64_t pending_recovery_errors_{0};
     std::uint64_t synthetic_pts_us_{0};
+    std::uint64_t synthetic_pace_us_{0};
     std::uint64_t resync_generation_{0};
     std::uint64_t resync_dropped_packets_{0};
     std::int64_t resync_deadline_us_{0};
@@ -1763,6 +2042,7 @@ private:
     double reported_fps_{0.0};
     bool waiting_for_idr_{true};
     bool resync_active_{false};
+    bool bsf_flush_sent_{false};
 };
 
 bool RecordCleanupResult(const char* api, AX_S32 result) {
@@ -2952,6 +3232,142 @@ private:
     IvpsStatistics statistics_{};
 };
 
+struct SnapshotCaptureStatistics {
+    std::uint64_t frames{0};
+    std::uint64_t errors{0};
+    double total_ms{0.0};
+};
+
+class NativeSnapshotCapture final {
+public:
+    ~NativeSnapshotCapture() {
+        (void)Close();
+    }
+
+    bool Open() {
+        (void)Close();
+        static_assert(kSnapshotBytes <=
+                          static_cast<std::size_t>(std::numeric_limits<AX_U32>::max()),
+                      "snapshot buffer must fit AX_U32");
+        const auto* token = reinterpret_cast<const AX_S8*>("yolo26-snapshot-bgr");
+        const auto ret = AXCL_SYS_MemAlloc(
+            &physical_address_, &virtual_address_, static_cast<AX_U32>(kSnapshotBytes),
+            0x1000, token);
+        if (ret != AX_SUCCESS || physical_address_ == 0 || virtual_address_ == nullptr) {
+            LogError("[SNAPSHOT] AXCL_SYS_MemAlloc failed: 0x%08X",
+                     static_cast<unsigned int>(ret));
+            physical_address_ = 0;
+            virtual_address_ = nullptr;
+            ++statistics_.errors;
+            return false;
+        }
+
+        output_frame_ = {};
+        output_frame_.u32Width = kSourceWidth;
+        output_frame_.u32Height = kSourceHeight;
+        output_frame_.s16CropX = 0;
+        output_frame_.s16CropY = 0;
+        output_frame_.s16CropWidth = kSourceWidth;
+        output_frame_.s16CropHeight = kSourceHeight;
+        output_frame_.enImgFormat = AX_FORMAT_BGR888;
+        output_frame_.enVscanFormat = AX_VSCAN_FORMAT_RASTER;
+        output_frame_.stCompressInfo.enCompressMode = AX_COMPRESS_MODE_NONE;
+        output_frame_.stDynamicRange = AX_DYNAMIC_RANGE_SDR8;
+        output_frame_.stColorGamut = AX_COLOR_GAMUT_BT709;
+        output_frame_.u32PicStride[0] = static_cast<AX_U32>(kSnapshotStride);
+        output_frame_.u32FrameSize = static_cast<AX_U32>(kSnapshotBytes);
+        output_frame_.u64PhyAddr[0] = physical_address_;
+        output_frame_.u64VirAddr[0] =
+            static_cast<AX_U64>(reinterpret_cast<std::uintptr_t>(virtual_address_));
+        for (auto& block_id : output_frame_.u32BlkId) {
+            block_id = AX_INVALID_BLOCKID;
+        }
+        LogInfo("[SNAPSHOT] full-resolution IVPS capture ready: %dx%d BGR888 "
+                "stride=%zu bytes=%zu",
+                kSourceWidth, kSourceHeight, kSnapshotStride, kSnapshotBytes);
+        return true;
+    }
+
+    bool Capture(const AX_VIDEO_FRAME_INFO_T& decoded_frame,
+                 std::vector<std::uint8_t>* host_bgr) {
+        if (host_bgr == nullptr || physical_address_ == 0) {
+            ++statistics_.errors;
+            LogError("[SNAPSHOT] capture called with invalid state");
+            return false;
+        }
+        if (decoded_frame.stVFrame.u32Width != kSourceWidth ||
+            decoded_frame.stVFrame.u32Height != kSourceHeight ||
+            decoded_frame.stVFrame.enImgFormat != AX_FORMAT_YUV420_SEMIPLANAR) {
+            ++statistics_.errors;
+            LogError("[SNAPSHOT] expected NV12 %dx%d, actual=%ux%u format=%d",
+                     kSourceWidth, kSourceHeight, decoded_frame.stVFrame.u32Width,
+                     decoded_frame.stVFrame.u32Height,
+                     static_cast<int>(decoded_frame.stVFrame.enImgFormat));
+            return false;
+        }
+
+        const auto begin = Clock::now();
+        AX_IVPS_ASPECT_RATIO_T aspect{};
+        aspect.eMode = AX_IVPS_ASPECT_RATIO_AUTO;
+        aspect.eAligns[0] = AX_IVPS_ASPECT_RATIO_HORIZONTAL_CENTER;
+        aspect.eAligns[1] = AX_IVPS_ASPECT_RATIO_VERTICAL_CENTER;
+        aspect.nBgColor = 0;
+        AX_VIDEO_FRAME_T source = decoded_frame.stVFrame;
+        const auto ivps_ret = AXCL_IVPS_CropResizeVgp(&source, &output_frame_, &aspect);
+        if (ivps_ret != AX_SUCCESS) {
+            ++statistics_.errors;
+            LogError("[SNAPSHOT] full-resolution AXCL_IVPS_CropResizeVgp failed: 0x%08X",
+                     static_cast<unsigned int>(ivps_ret));
+            return false;
+        }
+
+        try {
+            host_bgr->resize(kSnapshotBytes);
+        } catch (const std::bad_alloc&) {
+            ++statistics_.errors;
+            LogError("[SNAPSHOT] host BGR allocation failed: bytes=%zu", kSnapshotBytes);
+            host_bgr->clear();
+            return false;
+        }
+        const auto copy_ret = axclrtMemcpy(
+            host_bgr->data(),
+            reinterpret_cast<const void*>(static_cast<std::uintptr_t>(physical_address_)),
+            host_bgr->size(), AXCL_MEMCPY_DEVICE_TO_HOST);
+        if (copy_ret != AXCL_SUCC) {
+            ++statistics_.errors;
+            LogError("[SNAPSHOT] full-resolution D2H readback failed: 0x%08X",
+                     static_cast<unsigned int>(copy_ret));
+            host_bgr->clear();
+            return false;
+        }
+
+        ++statistics_.frames;
+        statistics_.total_ms += ElapsedMilliseconds(begin);
+        return true;
+    }
+
+    bool Close() {
+        bool successful = true;
+        if (physical_address_ != 0 && virtual_address_ != nullptr) {
+            successful = RecordCleanupResult(
+                "AXCL_SYS_MemFree(snapshot)",
+                AXCL_SYS_MemFree(physical_address_, virtual_address_));
+        }
+        physical_address_ = 0;
+        virtual_address_ = nullptr;
+        output_frame_ = {};
+        return successful;
+    }
+
+    const SnapshotCaptureStatistics& statistics() const { return statistics_; }
+
+private:
+    AX_U64 physical_address_{0};
+    AX_VOID* virtual_address_{nullptr};
+    AX_VIDEO_FRAME_T output_frame_{};
+    SnapshotCaptureStatistics statistics_{};
+};
+
 struct InferenceStatistics {
     std::uint64_t frames{0};
     std::uint64_t errors{0};
@@ -3071,12 +3487,15 @@ public:
     }
 
     bool Run(std::size_t camera_id, std::uint64_t frame_index,
-             int source_width, int source_height, std::size_t* object_count) {
-        if (!opened_) {
+             int source_width, int source_height,
+             std::vector<detection::Object>* objects) {
+        if (!opened_ || objects == nullptr) {
             ++statistics_.errors;
-            LogError("[YOLO26] inference requested before model was opened");
+            LogError("[YOLO26] invalid inference request: opened=%d objects=%p",
+                     opened_ ? 1 : 0, static_cast<void*>(objects));
             return false;
         }
+        objects->clear();
 
         if (!warmed_up_) {
             LogInfo("[YOLO26] warmup %d times using the shared runner input", kWarmupCount);
@@ -3100,9 +3519,8 @@ public:
         const double inference_ms = ElapsedMilliseconds(inference_begin);
 
         const auto postprocess_begin = Clock::now();
-        std::vector<detection::Object> objects;
         if (!PostprocessYolo26(runner_.get_outputs_ptr(kModelGroupId), runner_.get_num_outputs(),
-                               source_width, source_height, &objects)) {
+                               source_width, source_height, objects)) {
             ++statistics_.errors;
             return false;
         }
@@ -3111,12 +3529,10 @@ public:
         ++statistics_.frames;
         statistics_.inference_total_ms += inference_ms;
         statistics_.postprocess_total_ms += postprocess_ms;
-        if (object_count != nullptr) {
-            *object_count = objects.size();
-        }
 
         LogInfo("[DETECTION] camera=%zu frame=%llu objects=%zu inference_ms=%.3f",
-                camera_id, static_cast<unsigned long long>(frame_index), objects.size(), inference_ms);
+                camera_id, static_cast<unsigned long long>(frame_index), objects->size(),
+                inference_ms);
         return true;
     }
 
@@ -3139,6 +3555,391 @@ private:
     AX_U64 input_physical_address_{0};
     std::size_t input_bytes_{0};
     InferenceStatistics statistics_{};
+};
+
+struct SnapshotJob {
+    std::size_t camera_id{0};
+    std::uint64_t frame_uid{0};
+    std::uint64_t pts_us{0};
+    int width{0};
+    int height{0};
+    std::chrono::system_clock::time_point captured_at{};
+    std::vector<std::uint8_t> bgr;
+    std::vector<detection::Object> objects;
+};
+
+enum class NewFileWriteStatus {
+    kSuccess,
+    kAlreadyExists,
+    kError,
+};
+
+NewFileWriteStatus WriteNewBinaryFile(const fs::path& path,
+                                      const std::vector<std::uint8_t>& data,
+                                      std::string* error_text) {
+#ifdef _WIN32
+    const HANDLE handle = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+                                      nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL,
+                                      nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        const DWORD error = GetLastError();
+        if (error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS) {
+            return NewFileWriteStatus::kAlreadyExists;
+        }
+        if (error_text != nullptr) {
+            *error_text = "Windows error " + std::to_string(error);
+        }
+        return NewFileWriteStatus::kError;
+    }
+
+    std::size_t offset = 0;
+    DWORD write_error = ERROR_SUCCESS;
+    while (offset < data.size()) {
+        const std::size_t remaining = data.size() - offset;
+        const DWORD chunk = static_cast<DWORD>(std::min<std::size_t>(
+            remaining, static_cast<std::size_t>(std::numeric_limits<DWORD>::max())));
+        DWORD written = 0;
+        if (!WriteFile(handle, data.data() + offset, chunk, &written, nullptr) ||
+            written == 0) {
+            write_error = GetLastError();
+            break;
+        }
+        offset += written;
+    }
+    if (!CloseHandle(handle) && write_error == ERROR_SUCCESS) {
+        write_error = GetLastError();
+    }
+    if (write_error != ERROR_SUCCESS || offset != data.size()) {
+        (void)DeleteFileW(path.c_str());
+        if (error_text != nullptr) {
+            *error_text = "Windows error " + std::to_string(write_error);
+        }
+        return NewFileWriteStatus::kError;
+    }
+    return NewFileWriteStatus::kSuccess;
+#else
+    const std::string native_path = path.u8string();
+    const int descriptor = open(native_path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (descriptor == -1) {
+        if (errno == EEXIST) {
+            return NewFileWriteStatus::kAlreadyExists;
+        }
+        if (error_text != nullptr) {
+            *error_text = std::error_code(errno, std::generic_category()).message();
+        }
+        return NewFileWriteStatus::kError;
+    }
+
+    std::size_t offset = 0;
+    int write_error = 0;
+    while (offset < data.size()) {
+        const ssize_t written = write(descriptor, data.data() + offset,
+                                      data.size() - offset);
+        if (written < 0 && errno == EINTR) {
+            continue;
+        }
+        if (written <= 0) {
+            write_error = written < 0 ? errno : EIO;
+            break;
+        }
+        offset += static_cast<std::size_t>(written);
+    }
+    if (close(descriptor) != 0 && write_error == 0) {
+        write_error = errno;
+    }
+    if (write_error != 0 || offset != data.size()) {
+        (void)unlink(native_path.c_str());
+        if (error_text != nullptr) {
+            *error_text = std::error_code(write_error, std::generic_category()).message();
+        }
+        return NewFileWriteStatus::kError;
+    }
+    return NewFileWriteStatus::kSuccess;
+#endif
+}
+
+class SnapshotWriter final {
+public:
+    SnapshotWriter() {
+        for (auto& count : saved_) {
+            count.store(0, std::memory_order_relaxed);
+        }
+        for (auto& count : dropped_) {
+            count.store(0, std::memory_order_relaxed);
+        }
+        for (auto& count : errors_) {
+            count.store(0, std::memory_order_relaxed);
+        }
+    }
+
+    ~SnapshotWriter() {
+        StopAndJoin();
+    }
+
+    SnapshotWriter(const SnapshotWriter&) = delete;
+    SnapshotWriter& operator=(const SnapshotWriter&) = delete;
+
+    bool Start(const std::string& directory) {
+        if (directory.empty()) {
+            LogError("[SNAPSHOT] image directory is empty");
+            return false;
+        }
+        output_directory_ = fs::path(directory);
+        std::error_code error;
+        fs::create_directories(output_directory_, error);
+        if (error) {
+            LogError("[SNAPSHOT] cannot create image directory: %s (%s)",
+                     PathForLog(output_directory_).c_str(), error.message().c_str());
+            return false;
+        }
+        const bool is_directory = fs::is_directory(output_directory_, error);
+        if (error || !is_directory) {
+            const std::string reason = error ? error.message() : "path is not a directory";
+            LogError("[SNAPSHOT] invalid image directory: %s (%s)",
+                     PathForLog(output_directory_).c_str(), reason.c_str());
+            return false;
+        }
+        try {
+            worker_ = std::thread(&SnapshotWriter::Run, this);
+        } catch (const std::system_error& exception) {
+            LogError("[SNAPSHOT] writer thread creation failed: %s", exception.what());
+            return false;
+        }
+        started_ = true;
+        LogInfo("[SNAPSHOT] writer started: directory=%s queue_capacity=%zu jpeg_quality=%d",
+                PathForLog(output_directory_).c_str(), kSnapshotQueueCapacity,
+                kSnapshotJpegQuality);
+        return true;
+    }
+
+    bool Enqueue(SnapshotJob job) {
+        if (job.camera_id >= kCameraCount) {
+            LogError("[SNAPSHOT] invalid camera id in save job: %zu", job.camera_id);
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!started_ || stopping_ || queue_.size() >= kSnapshotQueueCapacity) {
+            dropped_[job.camera_id].fetch_add(1, std::memory_order_relaxed);
+            LogWarning("[SNAPSHOT] save job dropped: camera=%zu frame_uid=%llu "
+                       "queue=%zu capacity=%zu stopping=%d",
+                       job.camera_id,
+                       static_cast<unsigned long long>(job.frame_uid), queue_.size(),
+                       kSnapshotQueueCapacity, stopping_ ? 1 : 0);
+            return false;
+        }
+        queue_.emplace_back(std::move(job));
+        condition_.notify_one();
+        return true;
+    }
+
+    void StopAndJoin() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!started_) {
+                return;
+            }
+            stopping_ = true;
+        }
+        condition_.notify_all();
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+        started_ = false;
+        for (std::size_t camera_id = 0; camera_id < kCameraCount; ++camera_id) {
+            LogInfo("[SNAPSHOT][FINAL] camera=%zu saved=%llu dropped=%llu errors=%llu",
+                    camera_id,
+                    static_cast<unsigned long long>(
+                        saved_[camera_id].load(std::memory_order_relaxed)),
+                    static_cast<unsigned long long>(
+                        dropped_[camera_id].load(std::memory_order_relaxed)),
+                    static_cast<unsigned long long>(
+                        errors_[camera_id].load(std::memory_order_relaxed)));
+        }
+    }
+
+private:
+    static cv::Scalar ColorForLabel(int label) {
+        const unsigned int value = static_cast<unsigned int>(std::max(label, 0));
+        return cv::Scalar(64U + (37U * value) % 192U,
+                          64U + (17U * value) % 192U,
+                          64U + (29U * value) % 192U);
+    }
+
+    static void DrawLabel(cv::Mat* image, const std::string& text, int left, int top,
+                          const cv::Scalar& color) {
+        constexpr double kFontScale = 0.8;
+        constexpr int kThickness = 2;
+        int baseline = 0;
+        const cv::Size size = cv::getTextSize(
+            text, cv::FONT_HERSHEY_SIMPLEX, kFontScale, kThickness, &baseline);
+        const int x = std::clamp(left, 0, std::max(image->cols - size.width, 0));
+        const int y = top - size.height - baseline >= 0
+                          ? top - size.height - baseline
+                          : std::min(top + baseline, std::max(image->rows - size.height - baseline, 0));
+        cv::rectangle(*image, cv::Rect(x, y, std::min(size.width, image->cols - x),
+                                      std::min(size.height + baseline, image->rows - y)),
+                      color, cv::FILLED);
+        cv::putText(*image, text, cv::Point(x, y + size.height),
+                    cv::FONT_HERSHEY_SIMPLEX, kFontScale, cv::Scalar(255, 255, 255),
+                    kThickness, cv::LINE_AA);
+    }
+
+    bool RenderAndWrite(SnapshotJob* job) {
+        if (job == nullptr || job->camera_id >= kCameraCount ||
+            job->width != kSourceWidth || job->height != kSourceHeight ||
+            job->bgr.size() != kSnapshotBytes) {
+            LogError("[SNAPSHOT] invalid save job payload");
+            return false;
+        }
+
+        cv::Mat image(job->height, job->width, CV_8UC3, job->bgr.data(),
+                      kSnapshotStride);
+        for (const auto& object : job->objects) {
+            if (!std::isfinite(object.rect.x) || !std::isfinite(object.rect.y) ||
+                !std::isfinite(object.rect.width) ||
+                !std::isfinite(object.rect.height) || !std::isfinite(object.prob)) {
+                continue;
+            }
+            const int left = std::clamp(
+                static_cast<int>(std::floor(object.rect.x)), 0, image.cols - 1);
+            const int top = std::clamp(
+                static_cast<int>(std::floor(object.rect.y)), 0, image.rows - 1);
+            const int right = std::clamp(
+                static_cast<int>(std::ceil(object.rect.x + object.rect.width)),
+                0, image.cols - 1);
+            const int bottom = std::clamp(
+                static_cast<int>(std::ceil(object.rect.y + object.rect.height)),
+                0, image.rows - 1);
+            if (right <= left || bottom <= top) {
+                continue;
+            }
+            const cv::Scalar color = ColorForLabel(object.label);
+            cv::rectangle(image, cv::Point(left, top), cv::Point(right, bottom),
+                          color, 3, cv::LINE_AA);
+            const char* class_name =
+                object.label >= 0 && object.label < kClassCount
+                    ? kClassNames[static_cast<std::size_t>(object.label)]
+                    : "unknown";
+            char label[160]{};
+            std::snprintf(label, sizeof(label), "%s %.1f%%", class_name,
+                          static_cast<double>(object.prob) * 100.0);
+            DrawLabel(&image, label, left, top, color);
+        }
+
+        const std::string captured_time = WallClockTimestampAt(job->captured_at);
+        char header[192]{};
+        std::snprintf(header, sizeof(header), "camera=%zu time=%s objects=%zu",
+                      job->camera_id, captured_time.c_str(), job->objects.size());
+        constexpr double kHeaderFontScale = 0.9;
+        constexpr int kHeaderThickness = 2;
+        int header_baseline = 0;
+        const cv::Size header_size = cv::getTextSize(
+            header, cv::FONT_HERSHEY_SIMPLEX, kHeaderFontScale,
+            kHeaderThickness, &header_baseline);
+        cv::rectangle(image,
+                      cv::Rect(0, 0, std::min(header_size.width + 16, image.cols),
+                               std::min(header_size.height + header_baseline + 16,
+                                        image.rows)),
+                      cv::Scalar(0, 0, 0), cv::FILLED);
+        cv::putText(image, header, cv::Point(8, header_size.height + 8),
+                    cv::FONT_HERSHEY_SIMPLEX, kHeaderFontScale,
+                    cv::Scalar(255, 255, 255), kHeaderThickness, cv::LINE_AA);
+
+        std::vector<std::uint8_t> encoded;
+        const std::vector<int> parameters{
+            cv::IMWRITE_JPEG_QUALITY, kSnapshotJpegQuality};
+        try {
+            if (!cv::imencode(".jpg", image, encoded, parameters)) {
+                LogError("[SNAPSHOT] JPEG encoding returned false: camera=%zu frame_uid=%llu",
+                         job->camera_id,
+                         static_cast<unsigned long long>(job->frame_uid));
+                return false;
+            }
+        } catch (const cv::Exception& exception) {
+            LogError("[SNAPSHOT] JPEG encoding failed: camera=%zu frame_uid=%llu error=%s",
+                     job->camera_id,
+                     static_cast<unsigned long long>(job->frame_uid),
+                     exception.what());
+            return false;
+        }
+
+        const std::string prefix =
+            "camera" + std::to_string(job->camera_id) + "_" +
+            FileTimestampAt(job->captured_at) + "_pid" +
+            std::to_string(CurrentProcessId()) + "_frame" +
+            std::to_string(job->frame_uid);
+        std::string write_error;
+        for (unsigned int collision = 0; collision < 1000; ++collision) {
+            std::string file_name = prefix;
+            if (collision != 0) {
+                file_name += "_" + std::to_string(collision);
+            }
+            const fs::path path = output_directory_ / (file_name + ".jpg");
+            const NewFileWriteStatus status =
+                WriteNewBinaryFile(path, encoded, &write_error);
+            if (status == NewFileWriteStatus::kAlreadyExists) {
+                continue;
+            }
+            if (status == NewFileWriteStatus::kError) {
+                LogError("[SNAPSHOT] write failed: %s (%s)",
+                         PathForLog(path).c_str(), write_error.c_str());
+                return false;
+            }
+            LogInfo("[SNAPSHOT] saved: path=%s frame_uid=%llu pts_us=%llu objects=%zu",
+                    PathForLog(path).c_str(),
+                    static_cast<unsigned long long>(job->frame_uid),
+                    static_cast<unsigned long long>(job->pts_us),
+                    job->objects.size());
+            return true;
+        }
+        LogError("[SNAPSHOT] unique filename collision budget exhausted: prefix=%s",
+                 prefix.c_str());
+        return false;
+    }
+
+    void Run() {
+        while (true) {
+            SnapshotJob job;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                condition_.wait(lock, [&] { return stopping_ || !queue_.empty(); });
+                if (queue_.empty()) {
+                    if (stopping_) {
+                        break;
+                    }
+                    continue;
+                }
+                job = std::move(queue_.front());
+                queue_.pop_front();
+            }
+
+            ScopedCameraLogContext log_context(static_cast<int>(job.camera_id));
+            bool successful = false;
+            try {
+                successful = RenderAndWrite(&job);
+            } catch (const std::exception& exception) {
+                LogError("[SNAPSHOT] writer exception: %s", exception.what());
+            } catch (...) {
+                LogError("[SNAPSHOT] writer threw an unknown exception");
+            }
+            if (successful) {
+                saved_[job.camera_id].fetch_add(1, std::memory_order_relaxed);
+            } else {
+                errors_[job.camera_id].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+
+    fs::path output_directory_;
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    std::deque<SnapshotJob> queue_;
+    std::thread worker_;
+    std::array<std::atomic<std::uint64_t>, kCameraCount> saved_{};
+    std::array<std::atomic<std::uint64_t>, kCameraCount> dropped_{};
+    std::array<std::atomic<std::uint64_t>, kCameraCount> errors_{};
+    bool started_{false};
+    bool stopping_{false};
 };
 
 enum class CameraRunState {
@@ -3184,6 +3985,7 @@ struct RouteSnapshot {
     std::uint64_t pending_recovery_errors{0};
     VdecStatistics vdec{};
     IvpsStatistics ivps{};
+    SnapshotCaptureStatistics snapshot_capture{};
     std::uint64_t rate_skips{0};
     std::uint64_t busy_drops{0};
     std::uint64_t latest_replacements{0};
@@ -3191,14 +3993,19 @@ struct RouteSnapshot {
     std::uint64_t recovery_successes{0};
     std::uint64_t recovery_failures{0};
     std::uint64_t recovered_ffmpeg_errors{0};
+    std::uint64_t file_loops{0};
     double completed_recovery_downtime_ms{0.0};
     Clock::time_point recovery_started{};
 };
 
 struct FrameSlotMetadata {
+    std::uint64_t frame_uid{0};
     std::uint64_t decoded_frame_index{0};
+    std::uint64_t pts_us{0};
     int source_width{0};
     int source_height{0};
+    bool snapshot_required{false};
+    std::chrono::system_clock::time_point captured_at{};
 };
 
 class CameraRoute final {
@@ -3225,6 +4032,7 @@ public:
         next.pending_recovery_errors = demuxer.pending_recovery_errors();
         next.vdec = vdec.statistics();
         next.ivps = ivps.statistics();
+        next.snapshot_capture = snapshot_capture.statistics();
         next.rate_skips = rate_skips;
         next.busy_drops = busy_drops;
         next.latest_replacements = latest_replacements;
@@ -3232,6 +4040,7 @@ public:
         next.recovery_successes = recovery_successes;
         next.recovery_failures = recovery_failures;
         next.recovered_ffmpeg_errors = recovered_ffmpeg_errors;
+        next.file_loops = file_loops;
         next.completed_recovery_downtime_ms = completed_recovery_downtime_ms;
         next.recovery_started = recovery_started;
         std::lock_guard<std::mutex> lock(snapshot_mutex);
@@ -3248,14 +4057,19 @@ public:
     FfmpegRtspDemuxer demuxer;
     NativeVdec vdec;
     NativeIvpsPreprocessor ivps;
+    NativeSnapshotCapture snapshot_capture;
+    FilePlaybackClock playback_clock;
 
     mutable std::mutex slot_mutex;
     bool slot_writing{false};
     bool slot_ready{false};
     bool slot_copying{false};
     FrameSlotMetadata slot_metadata{};
+    std::vector<std::uint8_t> slot_snapshot_bgr;
 
     Clock::time_point next_candidate{};
+    Clock::time_point next_snapshot{};
+    std::uint64_t frame_uid{0};
     std::uint64_t rate_skips{0};
     std::uint64_t busy_drops{0};
     std::uint64_t latest_replacements{0};
@@ -3263,6 +4077,7 @@ public:
     std::uint64_t recovery_successes{0};
     std::uint64_t recovery_failures{0};
     std::uint64_t recovered_ffmpeg_errors{0};
+    std::uint64_t file_loops{0};
     double completed_recovery_downtime_ms{0.0};
     Clock::time_point recovery_started{};
     bool raw_dump_written{false};
@@ -3427,6 +4242,7 @@ void InvalidateLatestFrameSlot(CameraRoute* route) {
     route->slot_ready = false;
     route->slot_writing = false;
     route->slot_metadata = FrameSlotMetadata{};
+    route->slot_snapshot_bgr.clear();
 }
 
 bool WaitForCameraRecovery(const std::atomic<bool>* stop_requested,
@@ -3466,13 +4282,15 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
             startup_reported = true;
             return;
         }
-        const RtspOpenResult initial_rtsp_open =
-            route->demuxer.Open(options->source, options->read_timeout_ms);
-        if (!initial_rtsp_open.successful()) {
-            LogError("[FFMPEG] initial RTSP open failed: classification=%s error=%d; "
+        const RtspOpenResult initial_input_open =
+            route->demuxer.Open(options->source, options->input_kind,
+                                options->read_timeout_ms);
+        if (!initial_input_open.successful()) {
+            LogError("[FFMPEG] initial %s open failed: classification=%s error=%d; "
                      "startup retries are disabled",
-                     RtspFailureReasonName(initial_rtsp_open.reason),
-                     initial_rtsp_open.error_code);
+                     InputKindName(options->input_kind),
+                     RtspFailureReasonName(initial_input_open.reason),
+                     initial_input_open.error_code);
             route->PublishSnapshot(CameraRunState::kFailed);
             startup_gate->Report(false);
             startup_reported = true;
@@ -3490,6 +4308,10 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
 
         route->next_candidate = *processing_started +
                                 kCameraPhaseStep * static_cast<int>(route->camera_id);
+        route->next_snapshot = *processing_started;
+        if (options->input_kind == InputKind::kLocalFile) {
+            route->playback_clock.Reset(*processing_started);
+        }
         route->PublishSnapshot(CameraRunState::kRunning);
         auto next_status_refresh = Clock::now() + std::chrono::seconds(1);
 
@@ -3508,15 +4330,22 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
                 return true;
             }
 
+            const std::uint64_t frame_uid = ++route->frame_uid;
             const auto now = Clock::now();
             if (now < route->next_candidate) {
                 ++route->rate_skips;
                 return true;
             }
             AdvancePeriodicDeadline(now, kInferencePeriod, &route->next_candidate);
+            const bool snapshot_due = options->save_images &&
+                                      now >= route->next_snapshot;
 
             std::unique_lock<std::mutex> slot_lock(route->slot_mutex, std::try_to_lock);
             if (!slot_lock.owns_lock() || route->slot_writing || route->slot_copying) {
+                ++route->busy_drops;
+                return true;
+            }
+            if (route->slot_ready && route->slot_metadata.snapshot_required) {
                 ++route->busy_drops;
                 return true;
             }
@@ -3525,9 +4354,24 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
             }
             route->slot_ready = false;
             route->slot_writing = true;
+            route->slot_metadata = FrameSlotMetadata{};
+            route->slot_snapshot_bgr.clear();
             slot_lock.unlock();
 
             const bool processed = route->ivps.Process(frame);
+            std::vector<std::uint8_t> snapshot_bgr;
+            bool snapshot_captured = false;
+            if (snapshot_due) {
+                AdvancePeriodicDeadline(now, kSnapshotPeriod, &route->next_snapshot);
+                if (processed) {
+                    snapshot_captured =
+                        route->snapshot_capture.Capture(frame, &snapshot_bgr);
+                    if (!snapshot_captured) {
+                        LogWarning("[SNAPSHOT] full-resolution capture failed; "
+                                   "inference continues without this image");
+                    }
+                }
+            }
             bool dump_ok = true;
             if (processed && route->camera_id == 0 && !route->raw_dump_written &&
                 !options->dump_ivps.empty()) {
@@ -3538,9 +4382,18 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
             slot_lock.lock();
             route->slot_writing = false;
             if (processed && dump_ok) {
+                route->slot_metadata.frame_uid = frame_uid;
                 route->slot_metadata.decoded_frame_index = route->vdec.statistics().decoded_frames;
+                route->slot_metadata.pts_us = frame.stVFrame.u64PTS;
                 route->slot_metadata.source_width = static_cast<int>(frame.stVFrame.u32Width);
                 route->slot_metadata.source_height = static_cast<int>(frame.stVFrame.u32Height);
+                route->slot_metadata.snapshot_required = snapshot_captured;
+                route->slot_metadata.captured_at =
+                    snapshot_captured ? std::chrono::system_clock::now()
+                                      : std::chrono::system_clock::time_point{};
+                if (snapshot_captured) {
+                    route->slot_snapshot_bgr = std::move(snapshot_bgr);
+                }
                 route->slot_ready = true;
             }
             slot_lock.unlock();
@@ -3690,34 +4543,37 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
                            route->camera_id, recovery_attempts_used,
                            remaining_recovery_budget(),
                            static_cast<unsigned long long>(route->recovery_attempts));
-                const RtspOpenResult rtsp_open =
-                    route->demuxer.Open(options->source, options->read_timeout_ms);
-                if (rtsp_open.status == RtspIoStatus::kInterrupted &&
+                const RtspOpenResult input_open =
+                    route->demuxer.Open(options->source, options->input_kind,
+                                        options->read_timeout_ms);
+                if (input_open.status == RtspIoStatus::kInterrupted &&
                     stop_requested->load(std::memory_order_relaxed)) {
                     break;
                 }
-                if (rtsp_open.status == RtspIoStatus::kRecoverableFailure) {
+                if (input_open.status == RtspIoStatus::kRecoverableFailure) {
                     if (!record_attempt_failure(
-                            "rtsp-transport", RtspFailureReasonName(rtsp_open.reason),
-                            rtsp_open.error_code)) {
+                            "rtsp-transport", RtspFailureReasonName(input_open.reason),
+                            input_open.error_code)) {
                         break;
                     }
                     route->PublishSnapshot(CameraRunState::kReconnecting);
                     continue;
                 }
-                if (!rtsp_open.successful()) {
-                    LogError("[RECOVERY] RTSP reopen is fatal: camera=%zu classification=%s "
+                if (!input_open.successful()) {
+                    LogError("[RECOVERY] %s reopen is fatal: camera=%zu classification=%s "
                              "attempt=%u remaining=%u error=%d elapsed_ms=%.3f",
-                             route->camera_id, RtspFailureReasonName(rtsp_open.reason),
+                             InputKindName(options->input_kind), route->camera_id,
+                             RtspFailureReasonName(input_open.reason),
                              recovery_attempts_used, remaining_recovery_budget(),
-                             rtsp_open.error_code, ElapsedMilliseconds(attempt_started));
+                             input_open.error_code, ElapsedMilliseconds(attempt_started));
                     route_failed = true;
                     break;
                 }
                 if (!thread_context.Bind()) {
                     route->demuxer.Close();
-                    LogError("[RECOVERY] worker context rebind failed after RTSP reopen; "
-                             "escalating to global failure");
+                    LogError("[RECOVERY] worker context rebind failed after %s reopen; "
+                             "escalating to global failure",
+                             InputKindName(options->input_kind));
                     route_failed = true;
                     break;
                 }
@@ -3746,6 +4602,9 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
                 }
 
                 session_open = true;
+                if (options->input_kind == InputKind::kLocalFile) {
+                    route->playback_clock.Reset(Clock::now());
+                }
                 next_status_refresh = Clock::now() + std::chrono::seconds(1);
                 LogInfo("[RECOVERY] camera session reopened: camera=%zu attempt=%u "
                         "remaining=%u new_group=%d elapsed_ms=%.3f "
@@ -3758,9 +4617,44 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
 
             AccessUnit access_unit;
             const auto read_timeout_us =
-                static_cast<std::int64_t>(options->read_timeout_ms) * 1000;
+                options->input_kind == InputKind::kRtsp
+                    ? static_cast<std::int64_t>(options->read_timeout_ms) * 1000
+                    : 0;
             const RtspReadResult read_result =
                 route->demuxer.Read(&access_unit, read_timeout_us);
+            if (read_result.status == RtspIoStatus::kLoopBoundary) {
+                if (options->input_kind != InputKind::kLocalFile ||
+                    !route->playback_clock.CompleteLoop()) {
+                    route_failed = true;
+                    break;
+                }
+                session_open = false;
+                const RtspOpenResult loop_open =
+                    route->demuxer.Open(options->source, options->input_kind,
+                                        options->read_timeout_ms);
+                if (loop_open.status == RtspIoStatus::kInterrupted &&
+                    stop_requested->load(std::memory_order_relaxed)) {
+                    session_open = route->vdec.is_open();
+                    break;
+                }
+                if (!loop_open.successful()) {
+                    LogError("[PLAYBACK] local file loop reopen failed: camera=%zu "
+                             "classification=%s error=%d",
+                             route->camera_id,
+                             RtspFailureReasonName(loop_open.reason),
+                             loop_open.error_code);
+                    route_failed = true;
+                    break;
+                }
+                session_open = true;
+                ++route->file_loops;
+                LogInfo("[PLAYBACK] local file loop restarted: camera=%zu loop=%llu",
+                        route->camera_id,
+                        static_cast<unsigned long long>(route->file_loops));
+                route->PublishSnapshot(recovering ? CameraRunState::kReconnecting
+                                                  : CameraRunState::kRunning);
+                continue;
+            }
             if (read_result.status == RtspIoStatus::kResynchronizing) {
                 reset_stable_budget_if_due(route->demuxer.resync_started());
                 const CameraRunState resync_state =
@@ -3777,8 +4671,9 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
                 if (stop_requested->load(std::memory_order_relaxed)) {
                     break;
                 }
-                LogError("[FFMPEG] RTSP read was interrupted without a stop request; "
-                         "classification=fatal-internal-state");
+                LogError("[FFMPEG] %s read was interrupted without a stop request; "
+                         "classification=fatal-internal-state",
+                         InputKindName(options->input_kind));
                 route_failed = true;
                 break;
             }
@@ -3796,9 +4691,10 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
                 continue;
             }
             if (read_result.status == RtspIoStatus::kFatalFailure) {
-                LogError("[FFMPEG] fatal RTSP/input failure: camera=%zu classification=%s "
+                LogError("[FFMPEG] fatal %s input failure: camera=%zu classification=%s "
                          "error=%d",
-                         route->camera_id, RtspFailureReasonName(read_result.reason),
+                         InputKindName(options->input_kind), route->camera_id,
+                         RtspFailureReasonName(read_result.reason),
                          read_result.error_code);
                 route_failed = true;
                 break;
@@ -3810,6 +4706,15 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
                          "classification=fatal-internal-state bytes=%zu",
                          access_unit.data.size());
                 route_failed = true;
+                break;
+            }
+
+            if (options->input_kind == InputKind::kLocalFile &&
+                !route->playback_clock.Pace(&access_unit, stop_requested)) {
+                if (!stop_requested->load(std::memory_order_relaxed)) {
+                    LogError("[PLAYBACK] local file pacing failed");
+                    route_failed = true;
+                }
                 break;
             }
 
@@ -3984,6 +4889,7 @@ void RunInferenceWorker(const std::vector<std::unique_ptr<CameraRoute>>* routes,
                         const Options* options, int runtime_device_id,
                         StartupGate* startup_gate, InferenceScheduler* scheduler,
                         InferenceSharedState* shared_state,
+                        SnapshotWriter* snapshot_writer,
                         std::atomic<bool>* stop_requested, std::atomic<bool>* failed,
                         std::condition_variable* lifecycle_condition) {
     AxclThreadContext thread_context;
@@ -4017,6 +4923,7 @@ void RunInferenceWorker(const std::vector<std::unique_ptr<CameraRoute>>* routes,
                 const std::size_t camera_id = (next_camera + offset) % kCameraCount;
                 CameraRoute& route = *(*routes)[camera_id];
                 FrameSlotMetadata metadata{};
+                std::vector<std::uint8_t> snapshot_bgr;
                 {
                     std::lock_guard<std::mutex> slot_lock(route.slot_mutex);
                     if (!route.slot_ready || route.slot_writing || route.slot_copying) {
@@ -4025,6 +4932,9 @@ void RunInferenceWorker(const std::vector<std::unique_ptr<CameraRoute>>* routes,
                     route.slot_copying = true;
                     route.slot_ready = false;
                     metadata = route.slot_metadata;
+                    if (metadata.snapshot_required) {
+                        snapshot_bgr = std::move(route.slot_snapshot_bgr);
+                    }
                 }
 
                 ScopedCameraLogContext inference_log_context(static_cast<int>(camera_id));
@@ -4040,17 +4950,36 @@ void RunInferenceWorker(const std::vector<std::unique_ptr<CameraRoute>>* routes,
                     break;
                 }
 
-                std::size_t object_count = 0;
+                std::vector<detection::Object> objects;
                 if (!yolo.Run(camera_id, metadata.decoded_frame_index,
-                              metadata.source_width, metadata.source_height, &object_count)) {
+                              metadata.source_width, metadata.source_height, &objects)) {
                     route.inference_errors.fetch_add(1, std::memory_order_relaxed);
                     shared_state->Publish(yolo.statistics());
                     worker_failed = true;
                     break;
                 }
                 route.inference_frames.fetch_add(1, std::memory_order_relaxed);
-                route.detections.fetch_add(static_cast<std::uint64_t>(object_count),
+                route.detections.fetch_add(static_cast<std::uint64_t>(objects.size()),
                                            std::memory_order_relaxed);
+                if (metadata.snapshot_required) {
+                    if (snapshot_writer == nullptr || snapshot_bgr.size() != kSnapshotBytes) {
+                        LogError("[SNAPSHOT] matched snapshot payload is invalid: "
+                                 "frame_uid=%llu bytes=%zu",
+                                 static_cast<unsigned long long>(metadata.frame_uid),
+                                 snapshot_bgr.size());
+                    } else {
+                        SnapshotJob job{};
+                        job.camera_id = camera_id;
+                        job.frame_uid = metadata.frame_uid;
+                        job.pts_us = metadata.pts_us;
+                        job.width = metadata.source_width;
+                        job.height = metadata.source_height;
+                        job.captured_at = metadata.captured_at;
+                        job.bgr = std::move(snapshot_bgr);
+                        job.objects = std::move(objects);
+                        (void)snapshot_writer->Enqueue(std::move(job));
+                    }
+                }
                 shared_state->Publish(yolo.statistics());
                 next_camera = (camera_id + 1) % kCameraCount;
                 handled = true;
@@ -4182,6 +5111,11 @@ void PrintMultiStatistics(const Options& options, Clock::time_point started,
                                            ? 0.0
                                            : snapshot.ivps.total_ms /
                                                  static_cast<double>(snapshot.ivps.frames);
+        const double snapshot_average_ms = snapshot.snapshot_capture.frames == 0
+                                               ? 0.0
+                                               : snapshot.snapshot_capture.total_ms /
+                                                     static_cast<double>(
+                                                         snapshot.snapshot_capture.frames);
         LogInfo("[%s_DETAIL] camera=%zu state=%s input_packets=%llu attempted_au=%llu "
                 "sent_au=%llu decoded_frames=%llu frame=%ux%u format=%d pts_us=%llu "
                 "vdec_errors=%llu vdec_stream_errors=%llu vdec_hw_errors=%llu "
@@ -4191,7 +5125,9 @@ void PrintMultiStatistics(const Options& options, Clock::time_point started,
                 "unrecovered_task_timeouts=%llu consecutive_task_timeouts=%llu "
                 "max_consecutive_task_timeouts=%llu slow_sends=%llu full_retries=%llu "
                 "send_avg_ms=%.3f send_max_ms=%.3f pending_au=%u pending_frames=%u "
-                "ivps_frames=%llu ivps_errors=%llu ivps_avg_ms=%.3f infer_frames=%llu "
+                "ivps_frames=%llu ivps_errors=%llu ivps_avg_ms=%.3f "
+                "snapshot_frames=%llu snapshot_errors=%llu snapshot_avg_ms=%.3f "
+                "infer_frames=%llu "
                 "infer_errors=%llu detections=%llu rate_skips=%llu busy_drops=%llu "
                 "latest_replacements=%llu ffmpeg_errors=%llu corrupt_packets=%llu "
                 "invalid_h264_packets=%llu resync_generation=%llu "
@@ -4199,7 +5135,7 @@ void PrintMultiStatistics(const Options& options, Clock::time_point started,
                 "pending_recovery_errors=%llu recovered_ffmpeg_errors=%llu "
                 "skipped_before_idr=%llu "
                 "recovery_attempts=%llu recovery_successes=%llu recovery_failures=%llu "
-                "recovery_downtime_ms=%.3f",
+                "recovery_downtime_ms=%.3f file_loops=%llu",
                 tag, camera_id, CameraRunStateName(snapshot.state),
                 static_cast<unsigned long long>(snapshot.input_packets),
                 static_cast<unsigned long long>(snapshot.vdec.attempted_access_units),
@@ -4226,6 +5162,9 @@ void PrintMultiStatistics(const Options& options, Clock::time_point started,
                 snapshot.vdec.left_stream_frames, snapshot.vdec.left_output_frames,
                 static_cast<unsigned long long>(snapshot.ivps.frames),
                 static_cast<unsigned long long>(snapshot.ivps.errors), ivps_average_ms,
+                static_cast<unsigned long long>(snapshot.snapshot_capture.frames),
+                static_cast<unsigned long long>(snapshot.snapshot_capture.errors),
+                snapshot_average_ms,
                 static_cast<unsigned long long>(inferred),
                 static_cast<unsigned long long>(infer_errors),
                 static_cast<unsigned long long>(detections),
@@ -4244,7 +5183,8 @@ void PrintMultiStatistics(const Options& options, Clock::time_point started,
                 static_cast<unsigned long long>(snapshot.recovery_attempts),
                 static_cast<unsigned long long>(snapshot.recovery_successes),
                 static_cast<unsigned long long>(snapshot.recovery_failures),
-                recovery_downtime_ms);
+                recovery_downtime_ms,
+                static_cast<unsigned long long>(snapshot.file_loops));
 
         if (options.mode == RunMode::kInfer && !is_final) {
             if (snapshot.state == CameraRunState::kRunning &&
@@ -4301,10 +5241,17 @@ ParseOptionsResult ParseOptions(int argc, char* argv[], Options* options) {
     command.add("help", '?', "print this message");
     command.add("no-pause", 0, "do not pause an independently opened Windows console on exit");
     command.add<std::string>("mode", 'r', "vdec-smoke | ivps-smoke | infer", false, "infer");
-    command.add<std::string>("source", 's', "RTSP H.264 source URL", false, yolo26_defaults::kRtspSource);
+    command.add<std::string>("source", 's',
+                             "RTSP H.264 source URL; omit to loop the default local file",
+                             false, "");
     command.add<std::string>("model", 'm', "YOLO26 AX model path", false, yolo26_defaults::kModelPath);
     command.add<std::string>("config", 'c', "AXCL JSON config path", false, "");
     command.add<std::string>("dump-ivps", 'p', "one-shot 640x640 BGR raw dump path", false, "");
+    command.add("save-images", 0,
+                "save annotated JPEG images in infer mode; disabled by default");
+    command.add<std::string>("image-dir", 0,
+                             "annotated JPEG directory used with --save-images",
+                             false, kDefaultImageDirectory);
     command.add<int>("device", 'd', "AXCL device-list index", false, 0);
     command.add<int>("duration", 't', "run duration in seconds; 0 means until interrupted", false, 0);
     command.add<int>("read-timeout", 'o', "RTSP open/read timeout in milliseconds", false, 5000);
@@ -4328,17 +5275,28 @@ ParseOptionsResult ParseOptions(int argc, char* argv[], Options* options) {
         std::fflush(stderr);
         return ParseOptionsResult::kError;
     }
-    options->source = command.get<std::string>("source");
+    const bool source_explicit = command.exist("source");
+    options->source = source_explicit ? command.get<std::string>("source")
+                                      : kDefaultMp4Path;
+    options->input_kind = source_explicit ? InputKind::kRtsp : InputKind::kLocalFile;
     options->model = command.get<std::string>("model");
     options->axcl_config = command.get<std::string>("config");
     options->dump_ivps = command.get<std::string>("dump-ivps");
+    options->image_directory = command.get<std::string>("image-dir");
+    options->save_images = command.exist("save-images");
     options->device_index = command.get<int>("device");
     options->duration_seconds = command.get<int>("duration");
     options->read_timeout_ms = command.get<int>("read-timeout");
     options->statistics_interval_seconds = command.get<int>("stats-interval");
 
-    if (options->source.rfind("rtsp://", 0) != 0 && options->source.rfind("rtsps://", 0) != 0) {
+    if (source_explicit && !IsRtspUrl(options->source)) {
         std::fprintf(stderr, "--source must be an RTSP URL\n");
+        std::fflush(stderr);
+        return ParseOptionsResult::kError;
+    }
+    if (!source_explicit && !utilities::file_exist(options->source)) {
+        std::fprintf(stderr, "Default local file does not exist: %s\n",
+                     options->source.c_str());
         std::fflush(stderr);
         return ParseOptionsResult::kError;
     }
@@ -4360,6 +5318,16 @@ ParseOptionsResult ParseOptions(int argc, char* argv[], Options* options) {
     }
     if (options->mode == RunMode::kVdecSmoke && !options->dump_ivps.empty()) {
         std::fprintf(stderr, "--dump-ivps is unavailable in vdec-smoke mode\n");
+        std::fflush(stderr);
+        return ParseOptionsResult::kError;
+    }
+    if (options->save_images && options->mode != RunMode::kInfer) {
+        std::fprintf(stderr, "--save-images is available only in infer mode\n");
+        std::fflush(stderr);
+        return ParseOptionsResult::kError;
+    }
+    if (options->save_images && options->image_directory.empty()) {
+        std::fprintf(stderr, "--image-dir must not be empty with --save-images\n");
         std::fflush(stderr);
         return ParseOptionsResult::kError;
     }
@@ -4436,6 +5404,11 @@ int Run(const Options& options) {
         }
     } network_guard;
 
+    SnapshotWriter snapshot_writer;
+    if (options.save_images && !snapshot_writer.Start(options.image_directory)) {
+        return -1;
+    }
+
     AxclEnvironment environment;
     if (!environment.Initialize(options) || !environment.EnsureCurrentContext()) {
         return -1;
@@ -4454,7 +5427,8 @@ int Run(const Options& options) {
         const VdecOpenResult vdec_open =
             route.vdec.Open(kSourceWidth, kSourceHeight);
         if (!vdec_open.successful() ||
-            (options.mode != RunMode::kVdecSmoke && !route.ivps.Open())) {
+            (options.mode != RunMode::kVdecSmoke && !route.ivps.Open()) ||
+            (options.save_images && !route.snapshot_capture.Open())) {
             LogError("[SYSTEM] camera startup failed");
             return -1;
         }
@@ -4465,21 +5439,35 @@ int Run(const Options& options) {
                                           ? "until Ctrl+C"
                                           : std::to_string(options.duration_seconds) + "s";
     LogInfo("[CONFIG] mode=%s", ModeName(options.mode));
-    LogInfo("[CONFIG] RTSP source=%s (replicated across %zu independent connections)",
-            RedactRtspUrl(options.source).c_str(), kCameraCount);
+    const std::string logged_source = options.input_kind == InputKind::kRtsp
+                                          ? RedactRtspUrl(options.source)
+                                          : options.source;
+    LogInfo("[CONFIG] input=%s source=%s (replicated across %zu independent pipelines)",
+            InputKindName(options.input_kind), logged_source.c_str(), kCameraCount);
     LogInfo("[CONFIG] model=%s",
             options.mode == RunMode::kInfer ? options.model.c_str() : "<not loaded>");
     LogInfo("[CONFIG] duration=%s", duration_text.c_str());
     if (options.mode == RunMode::kInfer) {
-        LogInfo("[CONFIG] pipeline=%zu RTSP/VDEC workers, %zu VDEC groups, "
+        LogInfo("[CONFIG] pipeline=%zu demux/VDEC workers, %zu VDEC groups, "
                 "one BGR latest-frame slot per camera, one inference worker",
                 kCameraCount, kCameraCount);
-        LogInfo("[CONFIG] host decode/resize/CSC=disabled; selected BGR input uses device D2D copy");
+        if (options.save_images) {
+            LogInfo("[CONFIG] host decode/resize/CSC=disabled; selected model input uses device "
+                    "D2D; one 2560x1440 BGR snapshot per healthy camera per second uses "
+                    "IVPS+D2H");
+            LogInfo("[CONFIG] image_saving=enabled directory=%s jpeg_quality=%d "
+                    "queue_capacity=%zu",
+                    options.image_directory.c_str(), kSnapshotJpegQuality,
+                    kSnapshotQueueCapacity);
+        } else {
+            LogInfo("[CONFIG] host decode/resize/CSC=disabled; selected model input uses device "
+                    "D2D; image_saving=disabled");
+        }
     } else if (options.mode == RunMode::kIvpsSmoke) {
-        LogInfo("[CONFIG] pipeline=%zu RTSP/VDEC/IVPS workers, inference disabled",
+        LogInfo("[CONFIG] pipeline=%zu demux/VDEC/IVPS workers, inference disabled",
                 kCameraCount);
     } else {
-        LogInfo("[CONFIG] pipeline=%zu RTSP/VDEC workers, IVPS/inference disabled",
+        LogInfo("[CONFIG] pipeline=%zu demux/VDEC workers, IVPS/inference disabled",
                 kCameraCount);
     }
     if (options.mode != RunMode::kVdecSmoke) {
@@ -4499,6 +5487,10 @@ int Run(const Options& options) {
             kCameraRecoveryMaxAttempts,
             static_cast<long long>(kCameraRecoveryRetryDelay.count()),
             static_cast<long long>(kCameraRecoveryStableWindow.count()));
+    if (options.input_kind == InputKind::kLocalFile) {
+        LogInfo("[CONFIG] local file playback=original DTS pace, cumulative PTS, infinite loop; "
+                "normal EOF does not consume the RTSP recovery budget");
+    }
     if (!options.dump_ivps.empty()) {
         LogInfo("[CONFIG] --dump-ivps writes camera 0 only");
     }
@@ -4524,8 +5516,9 @@ int Run(const Options& options) {
         if (options.mode == RunMode::kInfer) {
             inference_thread = std::thread(RunInferenceWorker, &routes, &options,
                                            environment.runtime_device_id(), &startup_gate,
-                                           &scheduler, &inference_state, &stop_requested,
-                                           &failed, &lifecycle_condition);
+                                           &scheduler, &inference_state,
+                                           options.save_images ? &snapshot_writer : nullptr,
+                                           &stop_requested, &failed, &lifecycle_condition);
         }
     } catch (const std::system_error& exception) {
         LogError("[SYSTEM] worker thread creation failed: %s", exception.what());
@@ -4594,6 +5587,9 @@ int Run(const Options& options) {
         if (route_thread.joinable()) {
             route_thread.join();
         }
+    }
+    if (options.save_images) {
+        snapshot_writer.StopAndJoin();
     }
 
     if (!environment.EnsureCurrentContext()) {
@@ -4692,6 +5688,9 @@ int Run(const Options& options) {
     }
     for (auto& route : routes) {
         ScopedCameraLogContext log_context(static_cast<int>(route->camera_id));
+        if (options.save_images && !route->snapshot_capture.Close()) {
+            failed.store(true, std::memory_order_relaxed);
+        }
         if (!route->ivps.Close()) {
             failed.store(true, std::memory_order_relaxed);
         }
