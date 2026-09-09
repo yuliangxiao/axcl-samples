@@ -138,8 +138,10 @@ build-win\examples\axcl\axcl_yolo26.exe -m D:\models\yolo26n.axmodel -s "rtsp://
 - `infer`：四路 IVPS 分别写入自己的 CMM（连续媒体内存）最新帧槽，单推理线程将选中帧 D2D
   （设备到设备）复制到 `ax_runner_axcl` 固定输入，再执行 YOLO26 和 CPU 后处理。
 
-三种模式共用同一套运行期单路 RTSP/VDEC 有界恢复和最终退出判定；初次启动时任一路打开失败仍不重试，
-直接完成清理并返回 `-1`。本地文件的正常 EOF（文件结束）不属于故障：程序立即重开文件、保留现有 VDEC
+三种模式共用下面的输入选择机制、运行期单路 RTSP/VDEC 有界恢复和最终退出判定；初次启动时任一路打开失败仍不重试，
+等待各路完成启动尝试，清理后返回 `-1`。首次 RTSP 建连逐路执行，避免重复地址同时发起握手；每路日志记录打开的开始、
+结果及耗时。全部相机路准备就绪后才开始并行处理；逐路建连不会绕过服务端的总会话数量限制，启动总耗时可能
+累加各路的打开与探测耗时。本地文件的正常 EOF（文件结束）不属于故障：程序立即重开文件、保留现有 VDEC
 Group，并从下一个 IDR（即时解码刷新）帧开始下一轮。
 
 该目标默认不参与构建，避免没有 FFmpeg 开发包时影响已有示例。以下命令均在 Visual Studio 2022 Developer Command Prompt（开发者命令提示符）中执行。
@@ -166,25 +168,34 @@ cmake --build build-native --target ax_yolo26_rtsp_native -j 4
 build-native\examples\axcl\ax_yolo26_rtsp_native.exe
 ```
 
-原生目标沿用默认模型路径。无参数启动时默认进入 `infer` 模式，读取固定的 H.264、2560×1440 文件
-`D:\test.mp4`，并将它复制给四条独立解码与识别管线。该文件支持 MP4/MOV 和 MPEG-PS 封装；程序按
-内容识别容器，不依赖 `.mp4` 后缀。文件按 DTS（解码时间戳）原速读取，PTS
-（显示时间戳）跨循环保持递增，EOF 后持续从头循环；Linux 构建的对应默认路径为 `test.mp4`：
+原生目标沿用默认模型路径。无参数启动时默认进入 `infer` 模式，读取
+`examples\axcl\yolo26_defaults.hpp` 中的四元素数组 `kNativeRtspSources`；`camera=0～3` 按数组顺序
+分别连接对应的 RTSP 地址，启动四条独立解码与识别管线。四项初始值都引用该头文件已有的
+`kRtspSource`，即对同一地址建立四个独立连接，RTSP 服务端需允许同时连接四次。可以逐项改为各摄像头
+地址，也允许多个元素使用同一地址；修改默认数组后需要重新编译原生目标。每路输入须为 H.264、
+2560×1440，RTSP 使用 TCP：
 
 ```cmd
 build-native\examples\axcl\ax_yolo26_rtsp_native.exe
 ```
 
-`--model`/`-m` 可以覆盖模型路径。显式传入 `--source`/`-s` 时切换到 RTSP，参数必须是
-`rtsp://` 或 `rtsps://` URL；程序仍将唯一地址复制给 `camera=0～3`，RTSP 服务端必须允许同一地址
-同时连接四次：
+`--model`/`-m` 可以覆盖模型路径。显式传入 `--source`/`-s` 时，用一个地址统一覆盖四路 RTSP 输入，
+参数必须是 `rtsp://` 或 `rtsps://` URL，服务端必须允许同一地址同时连接四次。命令行不提供逐路地址参数：
 
 ```cmd
 build-native\examples\axcl\ax_yolo26_rtsp_native.exe --source "rtsp://user:password@192.168.0.201:554/Streaming/Channels/101"
 ```
 
-日志会隐藏 URL 中的密码。未显式传入 `--source` 时不会使用
-`examples\axcl\yolo26_defaults.hpp` 中的默认 RTSP 地址。
+显式传入 `--file <路径>` 时，四路都读取指定的同一本地文件。文件须为 H.264、2560×1440，支持
+MP4/MOV 和 MPEG-PS 封装；程序按内容识别容器，不依赖 `.mp4` 后缀。文件按 DTS（解码时间戳）原速读取，
+PTS（显示时间戳）跨循环保持递增，EOF 后持续从头循环：
+
+```cmd
+build-native\examples\axcl\ax_yolo26_rtsp_native.exe --file "D:\test.mp4"
+```
+
+`--file` 与 `--source` 互斥，同时传入会直接报错。未传入两者时使用默认 RTSP 数组，没有默认 MP4 路径，
+也不会自动回退到本地文件。日志会隐藏 URL 中的密码。
 
 程序通过命令行正常启动后，会在当前工作目录的 `log` 文件夹中创建独立日志文件，命名格式为
 `ax_yolo26_rtsp_native_日期_时间_毫秒_pid进程号.log`。应用日志统一带本地毫秒时间戳；逐帧
@@ -242,6 +253,52 @@ FFmpeg 累计诊断数，不直接决定退出码，
 `AXCL_VDEC_QueryStatus` 快照。Runtime Task（运行时任务）超时时不会重发结果不确定的 AU：设备状态确认
 已经接收时继续取帧，未确认接收时丢弃后续非 IDR 帧并从下一个 IDR 恢复。设备状态异常如果未归类为
 已确认暂态错误，仍视为不可恢复错误；连续三次任务超时也会协调停止全部四路并返回 `-1`。
+
+为定位“进程还在、四路却不再处理”的问题，程序在启动成功后的运行阶段，由主线程每秒检查各相机及
+共享推理线程的调用记录；检查周期独立于 `--stats-interval`。监测不调用 AXCL，只读取受短锁保护的
+Host 记录。正常调用不逐帧打印额外日志；调用超过 5 秒未返回，或 `running` 路线的统计快照超过
+5 秒未更新时，输出 `[WATCHDOG]`，每个工作线程持续异常每 30 秒重复一次。超过 5 秒的调用返回时还会打印
+`[CALL_RETURN]`，保留总耗时和返回值。这里的 5 秒是诊断告警阈值，不改变 SDK/RTSP 超时、恢复预算或
+退出策略；设置较长 `--read-timeout` 时，也可能看到正常等待中的读包告警。启动等待和退出清理阶段
+不运行此轮询，卡在这些阶段时需要线程转储辅助定位。
+
+`[WATCHDOG]` 中 `worker` 区分相机与共享推理线程，`active_camera` 表示该调用服务的相机；
+`thread_id` 在 Windows 上是系统线程号，可与转储中的线程对应。`active=1` 时，`api` 是尚未返回的
+调用，`call_id` 标识该线程的调用序号，`call_age_ms` 是已等待时间；`active=0` 时，`api` 只是最近一次
+调用，不能据此认定它阻塞。`last_api`、`last_ret` 和 `last_call_ms` 来自最近完成的调用，只有
+`last_result_known=1` 时返回码才有效。这些记录独立于处理统计，即使旧快照仍显示错误数为 0，
+也能看到前一次 SDK 返回的真实错误码。
+
+| 日志中的 `api` | 对应处理位置 |
+| --- | --- |
+| `av_read_frame` | FFmpeg 等待输入数据 |
+| `AXCL_VDEC_SendStream` | 把视频码流送入卡上的解码器 |
+| `AXCL_VDEC_QueryStatus.fault` / `.periodic` | 故障现场查询 / 常规解码状态查询 |
+| `AXCL_VDEC_GetChnFrame` / `AXCL_VDEC_ReleaseChnFrame` | 获取 / 释放解码帧 |
+| `AXCL_IVPS_CropResizeVgp.preprocess` | 卡上缩放和颜色转换 |
+| `axclrtMemcpy.inference-D2D` | 卡内复制模型输入 |
+| `runner.inference` / `.warmup` | 推理及输出同步 / 预热 |
+
+故障状态查询还会在 SDK 调用前后分别立即刷新 `[VDEC][FAULT_QUERY_BEGIN]` 和
+`[VDEC][FAULT_QUERY_END]`，使用相同的相机、`group`、`event` 关联；BEGIN 包含触发错误码和实时超时
+计数。如果只有 BEGIN、没有 END，且 WATCHDOG 持续显示该查询 `active=1`，即可定位到查询尚未返回。
+`[STATS_DETAIL]` 的 `snapshot_age_ms` 表示快照距今多久，`snapshot_stale=1` 表示运行路线快照超过
+5 秒未更新；控制台同时显示 `[stale]`，此时 `state=running` 和错误计数只是旧记录。
+
+再次发生异常时，先保留故障进程，在另一个 Windows 命令提示符中进入 AXCL 的 `bin` 目录，执行：
+
+```cmd
+axcl-smi > axcl_smi_at_stall.txt 2>&1
+axcl-smi log -d 0
+```
+
+第二条命令按[AXCL 官方日志采集说明](https://axcl-docs.readthedocs.io/zh-cn/latest/doc_guide_faq.html)
+导出设备侧日志。一起保留应用的完整日志、同期 Host `axcl_logs.txt`、设备日志包和状态输出，避免只
+截取最后几行。若命令本身也无响应，记录这一现象；应用内 WATCHDOG 不依赖这些命令返回。
+要确认 SDK 内部具体等待位置，可在 Windows 任务管理器的“详细信息”页为
+`ax_yolo26_rtsp_native.exe` [创建内存转储文件](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/task-manager-live-dump#create-a-memory-dump-for-a-user-mode-process)，
+并保留对应版本的 EXE/DLL/PDB。重启后能够运行
+`axcl-smi` 只能说明当前状态，不能替代故障当时的记录。
 
 程序成功启动后，RTSP 读取超时、EOF（流结束）、连接重置及已分类网络/I/O（输入输出）错误只触发
 故障相机路恢复；`AV_PKT_FLAG_CORRUPT` 标记的单个损坏包计入 `corrupt_packets` 和 `ffmpeg_errors`，
@@ -343,7 +400,7 @@ build-native\examples\axcl\ax_yolo26_rtsp_native.exe --mode ivps-smoke --duratio
 build-native\examples\axcl\ax_yolo26_rtsp_native.exe --mode infer --duration 60 --model "D:\yolo26\yolo26m.axmodel"
 ```
 
-上例使用默认 `D:\test.mp4`。切换到 RTSP 时显式增加 `--source`：
+上例使用默认四路 RTSP 配置。若要让四路临时使用同一 RTSP 地址，增加 `--source`：
 
 ```cmd
 build-native\examples\axcl\ax_yolo26_rtsp_native.exe --mode infer --duration 60 --model "D:\yolo26\yolo26m.axmodel" --source "rtsp://user:password@192.168.0.201:554/Streaming/Channels/101"
@@ -372,7 +429,8 @@ build-native\examples\axcl\ax_yolo26_rtsp_native.exe --mode infer --duration 60 
   一次约 1.2 MB 的设备内 D2D。默认不执行截图 D2H；传入 `--save-images` 后，每路每秒选中的截图帧
   会额外执行一次全分辨率 IVPS CSC 和约 10.55 MiB D2H，其他候选帧不回读原图。
 
-当前实现固定为四路、H.264、2560×1440，支持默认 MP4/MOV 或 MPEG-PS 本地文件循环，以及显式 RTSP over TCP。四条管线各自使用一个解码线程、Runtime Context
+当前实现固定为四路、H.264、2560×1440，默认按数组配置读取四路 RTSP over TCP，`--source` 可统一覆盖
+四路地址，`--file` 可显式启用同一 MP4/MOV 或 MPEG-PS 本地文件的四路循环。四条管线各自使用一个解码线程、Runtime Context
 （运行时上下文）、VDEC Group 和 IVPS 最新帧槽；四路共享一个模型和一个推理线程。每路使用固定单调
 时间轴限制为最多 11 FPS，四路相位按约 90.909 ms 的周期均匀错开；错过的节拍直接跳过，只处理最新帧，
 不补做历史帧。运行期已分类的 RTSP 传输故障与 `AX_ERR_VDEC_STRM_ERROR` 按上述共享预算执行单路重建；

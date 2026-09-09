@@ -40,6 +40,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -114,7 +115,10 @@ constexpr AX_U32 kH264FrameBufferCount = 8;
 constexpr AX_S32 kAxWaitMs = 100;
 constexpr double kSlowVdecSendMilliseconds = 50.0;
 constexpr std::uint64_t kMaxConsecutiveVdecTaskTimeouts = 3;
-constexpr std::size_t kCameraCount = 4;
+constexpr std::chrono::seconds kWorkerDiagnosticPeriod{1};
+constexpr std::chrono::seconds kWorkerStallWarningThreshold{5};
+constexpr std::chrono::seconds kWorkerStallWarningRepeat{30};
+constexpr std::size_t kCameraCount = yolo26_defaults::kNativeRtspSources.size();
 constexpr double kInferenceLimitFps = 11.0;
 constexpr std::chrono::microseconds kInferencePeriod{1'000'000 / 11};
 constexpr std::chrono::microseconds kCameraPhaseStep{
@@ -134,10 +138,8 @@ constexpr AX_S32 kAxclRuntimeTaskTimeout =
     AXCL_DEF_RUNTIME_ERR(AXCL_RUNTIME_TASK, AXCL_ERR_TIMEOUT);
 
 #ifdef _WIN32
-constexpr char kDefaultMp4Path[] = R"(D:\test.mp4)";
 constexpr char kDefaultImageDirectory[] = R"(D:\Images)";
 #else
-constexpr char kDefaultMp4Path[] = "test.mp4";
 constexpr char kDefaultImageDirectory[] = "Images";
 #endif
 
@@ -715,8 +717,8 @@ enum class RunMode {
 
 struct Options {
     RunMode mode{RunMode::kInfer};
-    InputKind input_kind{InputKind::kLocalFile};
-    std::string source{kDefaultMp4Path};
+    InputKind input_kind{InputKind::kRtsp};
+    std::array<std::string, kCameraCount> sources{};
     std::string model{yolo26_defaults::kModelPath};
     std::string axcl_config;
     std::string dump_ivps;
@@ -815,6 +817,153 @@ double ElapsedSeconds(Clock::time_point begin, Clock::time_point end = Clock::no
 
 double ElapsedMilliseconds(Clock::time_point begin, Clock::time_point end = Clock::now()) {
     return std::chrono::duration<double, std::milli>(end - begin).count();
+}
+
+struct WorkerCallSnapshot {
+    const char* api{"none"};
+    std::uint64_t call_id{0};
+    std::uint64_t thread_id{0};
+    int camera_id{-1};
+    Clock::time_point started{};
+    bool active{false};
+    const char* last_api{"none"};
+    std::uint32_t last_result{0};
+    bool last_result_known{false};
+    double last_elapsed_ms{0.0};
+};
+
+class WorkerDiagnostics final {
+public:
+    void Begin(const char* api) {
+        // Only metadata is protected: never hold this mutex across an SDK call or logging.
+        std::lock_guard<std::mutex> lock(mutex_);
+        snapshot_.api = api;
+        ++snapshot_.call_id;
+#ifdef _WIN32
+        snapshot_.thread_id = static_cast<std::uint64_t>(GetCurrentThreadId());
+#else
+        snapshot_.thread_id = static_cast<std::uint64_t>(
+            std::hash<std::thread::id>{}(std::this_thread::get_id()));
+#endif
+        snapshot_.camera_id = g_application_log_camera_id;
+        snapshot_.started = Clock::now();
+        snapshot_.active = true;
+    }
+
+    WorkerCallSnapshot End(bool result_known, std::uint32_t result) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        snapshot_.active = false;
+        snapshot_.last_api = snapshot_.api;
+        snapshot_.last_result = result;
+        snapshot_.last_result_known = result_known;
+        snapshot_.last_elapsed_ms = ElapsedMilliseconds(snapshot_.started);
+        return snapshot_;
+    }
+
+    WorkerCallSnapshot Read() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return snapshot_;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    WorkerCallSnapshot snapshot_{};
+};
+
+// Each worker owns a separate record that outlives its thread. Main-thread SDK calls
+// are not tracked. Instrument leaf calls so one record always describes one call.
+thread_local WorkerDiagnostics* g_worker_diagnostics = nullptr;
+
+class ScopedWorkerCall final {
+public:
+    explicit ScopedWorkerCall(const char* api) : diagnostics_(g_worker_diagnostics) {
+        if (diagnostics_ != nullptr) {
+            diagnostics_->Begin(api);
+        }
+    }
+
+    ~ScopedWorkerCall() {
+        if (diagnostics_ != nullptr) {
+            (void)diagnostics_->End(false, 0);
+        }
+    }
+
+    ScopedWorkerCall(const ScopedWorkerCall&) = delete;
+    ScopedWorkerCall& operator=(const ScopedWorkerCall&) = delete;
+
+    void Returned(bool result_known, std::uint32_t result) {
+        if (diagnostics_ == nullptr) {
+            return;
+        }
+        const WorkerCallSnapshot completed = diagnostics_->End(result_known, result);
+        diagnostics_ = nullptr;
+        if (completed.last_elapsed_ms >=
+            std::chrono::duration<double, std::milli>(kWorkerStallWarningThreshold).count()) {
+            LogWarning("[CALL_RETURN] thread_id=%llu api=%s call_id=%llu elapsed_ms=%.3f "
+                       "result_known=%d ret=0x%08X",
+                       static_cast<unsigned long long>(completed.thread_id), completed.api,
+                       static_cast<unsigned long long>(completed.call_id),
+                       completed.last_elapsed_ms, result_known ? 1 : 0,
+                       static_cast<unsigned int>(result));
+        }
+    }
+
+private:
+    WorkerDiagnostics* diagnostics_{nullptr};
+};
+
+template <typename Function>
+auto TraceWorkerCall(const char* api, Function&& function) {
+    ScopedWorkerCall call(api);
+    if constexpr (std::is_void_v<std::invoke_result_t<Function>>) {
+        function();
+        call.Returned(false, 0);
+    } else {
+        auto result = function();
+        call.Returned(true, static_cast<std::uint32_t>(result));
+        return result;
+    }
+}
+
+struct WorkerStallMonitor {
+    bool warned{false};
+    Clock::time_point last_warning{};
+};
+
+void CheckWorkerStall(const WorkerDiagnostics& diagnostics, const char* worker,
+                      int camera_id, const char* published_state, double snapshot_age_ms,
+                      bool snapshot_stale, WorkerStallMonitor* monitor) {
+    const WorkerCallSnapshot call = diagnostics.Read();
+    const auto now = Clock::now();
+    const double call_age_ms = call.active ? ElapsedMilliseconds(call.started, now) : 0.0;
+    const bool call_pending = call.active && now - call.started >= kWorkerStallWarningThreshold;
+    if (!call_pending && !snapshot_stale) {
+        if (monitor->warned) {
+            LogInfoFlush("[WATCHDOG] worker=%s camera=%d status=warning-cleared "
+                         "thread_id=%llu last_api=%s last_result_known=%d last_ret=0x%08X",
+                         worker, camera_id,
+                         static_cast<unsigned long long>(call.thread_id), call.last_api,
+                         call.last_result_known ? 1 : 0,
+                         static_cast<unsigned int>(call.last_result));
+        }
+        monitor->warned = false;
+        return;
+    }
+    if (monitor->warned && now - monitor->last_warning < kWorkerStallWarningRepeat) {
+        return;
+    }
+    LogWarning("[WATCHDOG] worker=%s camera=%d thread_id=%llu active_camera=%d "
+               "api=%s call_id=%llu active=%d call_age_ms=%.3f "
+               "published_state=%s snapshot_age_ms=%.3f snapshot_stale=%d "
+               "last_api=%s last_result_known=%d last_ret=0x%08X last_call_ms=%.3f "
+               "action=diagnostic-only",
+               worker, camera_id, static_cast<unsigned long long>(call.thread_id),
+               call.camera_id, call.api, static_cast<unsigned long long>(call.call_id),
+               call.active ? 1 : 0, call_age_ms, published_state, snapshot_age_ms,
+               snapshot_stale ? 1 : 0, call.last_api, call.last_result_known ? 1 : 0,
+               static_cast<unsigned int>(call.last_result), call.last_elapsed_ms);
+    monitor->warned = true;
+    monitor->last_warning = now;
 }
 
 void AdvancePeriodicDeadline(Clock::time_point now, Clock::duration period,
@@ -1305,7 +1454,9 @@ public:
         }
 
         ArmDeadline(interrupt_, input_kind_ == InputKind::kRtsp ? timeout_us_ : 0);
-        const int open_ret = avformat_open_input(&format_, source.c_str(), nullptr, &options);
+        const int open_ret = TraceWorkerCall("avformat_open_input", [&] {
+            return avformat_open_input(&format_, source.c_str(), nullptr, &options);
+        });
         const bool open_stopped = StopRequested();
         const bool open_timed_out = DeadlineExpired();
         ArmDeadline(interrupt_, 0);
@@ -1336,7 +1487,9 @@ public:
         }
 
         ArmDeadline(interrupt_, input_kind_ == InputKind::kRtsp ? timeout_us_ : 0);
-        const int info_ret = avformat_find_stream_info(format_, nullptr);
+        const int info_ret = TraceWorkerCall("avformat_find_stream_info", [&] {
+            return avformat_find_stream_info(format_, nullptr);
+        });
         const bool info_stopped = StopRequested();
         const bool info_timed_out = DeadlineExpired();
         ArmDeadline(interrupt_, 0);
@@ -1570,7 +1723,7 @@ public:
             av_bsf_free(&bsf_);
         }
         if (format_ != nullptr) {
-            avformat_close_input(&format_);
+            TraceWorkerCall("avformat_close_input", [&] { avformat_close_input(&format_); });
         }
         stream_ = nullptr;
         video_stream_index_ = -1;
@@ -1811,7 +1964,9 @@ private:
             if (interrupt_ != nullptr) {
                 interrupt_->deadline_us.store(deadline_us, std::memory_order_relaxed);
             }
-            const int ret = av_read_frame(format_, packet_);
+            const int ret = TraceWorkerCall("av_read_frame", [&] {
+                return av_read_frame(format_, packet_);
+            });
             const bool stopped = StopRequested();
             const bool timed_out = deadline_us != 0 && av_gettime_relative() >= deadline_us;
             ArmDeadline(interrupt_, 0);
@@ -2226,7 +2381,9 @@ public:
 
     bool Open(int runtime_device_id) {
         (void)Close();
-        const auto create_ret = axclrtCreateContext(&context_, runtime_device_id);
+        const auto create_ret = TraceWorkerCall("axclrtCreateContext", [&] {
+            return axclrtCreateContext(&context_, runtime_device_id);
+        });
         if (create_ret != AXCL_SUCC || context_ == nullptr) {
             LogError("[AXCL] worker axclrtCreateContext failed: 0x%08X",
                      static_cast<unsigned int>(create_ret));
@@ -2241,7 +2398,9 @@ public:
             LogError("[AXCL] worker cannot bind a null context");
             return false;
         }
-        const auto ret = axclrtSetCurrentContext(context_);
+        const auto ret = TraceWorkerCall("axclrtSetCurrentContext", [&] {
+            return axclrtSetCurrentContext(context_);
+        });
         if (ret != AXCL_SUCC) {
             LogError("[AXCL] worker axclrtSetCurrentContext failed: 0x%08X",
                      static_cast<unsigned int>(ret));
@@ -2255,13 +2414,17 @@ public:
             return true;
         }
         bool successful = true;
-        const auto bind_ret = axclrtSetCurrentContext(context_);
+        const auto bind_ret = TraceWorkerCall("axclrtSetCurrentContext.cleanup", [&] {
+            return axclrtSetCurrentContext(context_);
+        });
         if (bind_ret != AXCL_SUCC) {
             LogError("[CLEANUP] worker axclrtSetCurrentContext failed: 0x%08X",
                      static_cast<unsigned int>(bind_ret));
             successful = false;
         }
-        const auto destroy_ret = axclrtDestroyContext(context_);
+        const auto destroy_ret = TraceWorkerCall("axclrtDestroyContext", [&] {
+            return axclrtDestroyContext(context_);
+        });
         if (destroy_ret != AXCL_SUCC) {
             LogError("[CLEANUP] worker axclrtDestroyContext failed: 0x%08X",
                      static_cast<unsigned int>(destroy_ret));
@@ -2363,7 +2526,9 @@ public:
         group_attr.u32StreamBufSize = std::max<AX_U32>(aligned_width * aligned_height * 2U, 1024U * 1024U);
         group_attr.bSdkAutoFramePool = AX_TRUE;
 
-        if (const auto ret = AXCL_VDEC_CreateGrpEx(&group_, &group_attr); ret != AX_SUCCESS) {
+        if (const auto ret = TraceWorkerCall("AXCL_VDEC_CreateGrpEx", [&] {
+                return AXCL_VDEC_CreateGrpEx(&group_, &group_attr);
+            }); ret != AX_SUCCESS) {
             group_ = -1;
             LogError("[VDEC] AXCL_VDEC_CreateGrpEx failed: 0x%08X", static_cast<unsigned int>(ret));
             return FinishOpenFailure(ret, true);
@@ -2372,7 +2537,9 @@ public:
         AX_VDEC_GRP_PARAM_T group_param{};
         group_param.stVdecVideoParam.enOutputOrder = AX_VDEC_OUTPUT_ORDER_DISP;
         group_param.stVdecVideoParam.enVdecMode = VIDEO_DEC_MODE_IPB;
-        if (const auto ret = AXCL_VDEC_SetGrpParam(group_, &group_param); ret != AX_SUCCESS) {
+        if (const auto ret = TraceWorkerCall("AXCL_VDEC_SetGrpParam", [&] {
+                return AXCL_VDEC_SetGrpParam(group_, &group_param);
+            }); ret != AX_SUCCESS) {
             LogError("[VDEC] AXCL_VDEC_SetGrpParam failed: 0x%08X", static_cast<unsigned int>(ret));
             return FinishOpenFailure(ret, true);
         }
@@ -2393,24 +2560,32 @@ public:
             LogError("[VDEC] AX_VDEC_GetPicBufferSize returned 0");
             return FinishOpenFailure(AX_SUCCESS, false);
         }
-        if (const auto ret = AXCL_VDEC_SetChnAttr(group_, kVdecChannel, &channel_attr); ret != AX_SUCCESS) {
+        if (const auto ret = TraceWorkerCall("AXCL_VDEC_SetChnAttr", [&] {
+                return AXCL_VDEC_SetChnAttr(group_, kVdecChannel, &channel_attr);
+            }); ret != AX_SUCCESS) {
             LogError("[VDEC] AXCL_VDEC_SetChnAttr failed: 0x%08X", static_cast<unsigned int>(ret));
             return FinishOpenFailure(ret, true);
         }
-        if (const auto ret = AXCL_VDEC_EnableChn(group_, kVdecChannel); ret != AX_SUCCESS) {
+        if (const auto ret = TraceWorkerCall("AXCL_VDEC_EnableChn", [&] {
+                return AXCL_VDEC_EnableChn(group_, kVdecChannel);
+            }); ret != AX_SUCCESS) {
             LogError("[VDEC] AXCL_VDEC_EnableChn failed: 0x%08X", static_cast<unsigned int>(ret));
             return FinishOpenFailure(ret, true);
         }
         channel_enabled_ = true;
 
-        if (const auto ret = AXCL_VDEC_SetDisplayMode(group_, AX_VDEC_DISPLAY_MODE_PLAYBACK);
+        if (const auto ret = TraceWorkerCall("AXCL_VDEC_SetDisplayMode", [&] {
+                return AXCL_VDEC_SetDisplayMode(group_, AX_VDEC_DISPLAY_MODE_PLAYBACK);
+            });
             ret != AX_SUCCESS) {
             LogError("[VDEC] AXCL_VDEC_SetDisplayMode failed: 0x%08X", static_cast<unsigned int>(ret));
             return FinishOpenFailure(ret, true);
         }
         AX_VDEC_RECV_PIC_PARAM_T receive_param{};
         receive_param.s32RecvPicNum = -1;
-        if (const auto ret = AXCL_VDEC_StartRecvStream(group_, &receive_param); ret != AX_SUCCESS) {
+        if (const auto ret = TraceWorkerCall("AXCL_VDEC_StartRecvStream", [&] {
+                return AXCL_VDEC_StartRecvStream(group_, &receive_param);
+            }); ret != AX_SUCCESS) {
             LogError("[VDEC] AXCL_VDEC_StartRecvStream failed: 0x%08X", static_cast<unsigned int>(ret));
             return FinishOpenFailure(ret, true);
         }
@@ -2580,9 +2755,13 @@ public:
         bool successful = true;
         if (group_ >= 0 && started_) {
             const bool stop_successful = RecordVdecCleanupResult(
-                "AXCL_VDEC_StopRecvStream", AXCL_VDEC_StopRecvStream(group_));
-            const bool reset_successful =
-                RecordVdecCleanupResult("AXCL_VDEC_ResetGrp", AXCL_VDEC_ResetGrp(group_));
+                "AXCL_VDEC_StopRecvStream", TraceWorkerCall("AXCL_VDEC_StopRecvStream", [&] {
+                    return AXCL_VDEC_StopRecvStream(group_);
+                }));
+            const bool reset_successful = RecordVdecCleanupResult(
+                "AXCL_VDEC_ResetGrp", TraceWorkerCall("AXCL_VDEC_ResetGrp", [&] {
+                    return AXCL_VDEC_ResetGrp(group_);
+                }));
             successful = stop_successful && reset_successful && successful;
             if (stop_successful || reset_successful) {
                 started_ = false;
@@ -2590,15 +2769,19 @@ public:
         }
         if (group_ >= 0 && channel_enabled_) {
             const bool disable_successful = RecordVdecCleanupResult(
-                "AXCL_VDEC_DisableChn", AXCL_VDEC_DisableChn(group_, kVdecChannel));
+                "AXCL_VDEC_DisableChn", TraceWorkerCall("AXCL_VDEC_DisableChn", [&] {
+                    return AXCL_VDEC_DisableChn(group_, kVdecChannel);
+                }));
             successful = disable_successful && successful;
             if (disable_successful) {
                 channel_enabled_ = false;
             }
         }
         if (group_ >= 0) {
-            const bool destroy_successful =
-                RecordVdecCleanupResult("AXCL_VDEC_DestroyGrp", AXCL_VDEC_DestroyGrp(group_));
+            const bool destroy_successful = RecordVdecCleanupResult(
+                "AXCL_VDEC_DestroyGrp", TraceWorkerCall("AXCL_VDEC_DestroyGrp", [&] {
+                    return AXCL_VDEC_DestroyGrp(group_);
+                }));
             successful = destroy_successful && successful;
             if (destroy_successful) {
                 group_ = -1;
@@ -2625,7 +2808,9 @@ public:
         }
         AX_VDEC_GRP_STATUS_T status{};
         const auto begin = Clock::now();
-        const auto ret = AXCL_VDEC_QueryStatus(group_, &status);
+        const auto ret = TraceWorkerCall("AXCL_VDEC_QueryStatus.periodic", [&] {
+            return AXCL_VDEC_QueryStatus(group_, &status);
+        });
         const double query_ms = ElapsedMilliseconds(begin);
         if (ret != AX_SUCCESS) {
             ++statistics_.errors;
@@ -2779,7 +2964,9 @@ private:
         SendCallResult call{};
         call.call_sequence = ++statistics_.send_calls;
         const auto begin = Clock::now();
-        call.result = AXCL_VDEC_SendStream(group_, &stream, kAxWaitMs);
+        call.result = TraceWorkerCall("AXCL_VDEC_SendStream", [&] {
+            return AXCL_VDEC_SendStream(group_, &stream, kAxWaitMs);
+        });
         call.elapsed_ms = ElapsedMilliseconds(begin);
         statistics_.send_total_ms += call.elapsed_ms;
         statistics_.send_max_ms = std::max(statistics_.send_max_ms, call.elapsed_ms);
@@ -2849,9 +3036,22 @@ private:
         if (status == nullptr) {
             return false;
         }
+        // Flush the trigger and live counters before querying an already unresponsive device.
+        LogInfoFlush("[VDEC][FAULT_QUERY_BEGIN] event=%llu group=%d trigger_ret=0x%08X "
+                     "send_failures=%llu send_task_timeouts=%llu consecutive_task_timeouts=%llu",
+                     static_cast<unsigned long long>(failure_event_id), group_,
+                     static_cast<unsigned int>(statistics_.last_error_code),
+                     static_cast<unsigned long long>(statistics_.send_failures),
+                     static_cast<unsigned long long>(statistics_.send_runtime_timeouts),
+                     static_cast<unsigned long long>(statistics_.consecutive_task_timeouts));
         const auto begin = Clock::now();
-        const AX_S32 result = AXCL_VDEC_QueryStatus(group_, status);
+        const AX_S32 result = TraceWorkerCall("AXCL_VDEC_QueryStatus.fault", [&] {
+            return AXCL_VDEC_QueryStatus(group_, status);
+        });
         const double query_ms = ElapsedMilliseconds(begin);
+        LogInfoFlush("[VDEC][FAULT_QUERY_END] event=%llu group=%d ret=0x%08X query_ms=%.3f",
+                     static_cast<unsigned long long>(failure_event_id), group_,
+                     static_cast<unsigned int>(result), query_ms);
         if (result != AX_SUCCESS) {
             LogError("[VDEC] fault QueryStatus failed: event=%llu query_ms=%.3f ret=0x%08X",
                      static_cast<unsigned long long>(failure_event_id), query_ms,
@@ -3024,7 +3224,9 @@ private:
         AX_S32 wait_ms = first_wait_ms;
         while (true) {
             AX_VIDEO_FRAME_INFO_T frame{};
-            const auto ret = AXCL_VDEC_GetChnFrame(group_, kVdecChannel, &frame, wait_ms);
+            const auto ret = TraceWorkerCall("AXCL_VDEC_GetChnFrame", [&] {
+                return AXCL_VDEC_GetChnFrame(group_, kVdecChannel, &frame, wait_ms);
+            });
             if (ret == AX_ERR_VDEC_FLOW_END) {
                 if (flow_end != nullptr) {
                     *flow_end = true;
@@ -3058,7 +3260,9 @@ private:
                 ++statistics_.errors;
                 LogError("[VDEC] frame handler threw an unknown exception");
             }
-            const auto release_ret = AXCL_VDEC_ReleaseChnFrame(group_, kVdecChannel, &frame);
+            const auto release_ret = TraceWorkerCall("AXCL_VDEC_ReleaseChnFrame", [&] {
+                return AXCL_VDEC_ReleaseChnFrame(group_, kVdecChannel, &frame);
+            });
             if (release_ret != AX_SUCCESS) {
                 ++statistics_.errors;
                 statistics_.last_error_code = static_cast<std::uint32_t>(release_ret);
@@ -3153,8 +3357,11 @@ public:
         }
 
         const auto begin = Clock::now();
-        if (const auto ret = axclrtMemset(
-                reinterpret_cast<void*>(static_cast<std::uintptr_t>(physical_address_)), 0, kInputBytes);
+        if (const auto ret = TraceWorkerCall("axclrtMemset.ivps", [&] {
+                return axclrtMemset(
+                    reinterpret_cast<void*>(static_cast<std::uintptr_t>(physical_address_)),
+                    0, kInputBytes);
+            });
             ret != AXCL_SUCC) {
             ++statistics_.errors;
             LogError("[IVPS] axclrtMemset letterbox buffer failed: 0x%08X",
@@ -3169,7 +3376,9 @@ public:
         aspect.nBgColor = 0;
 
         AX_VIDEO_FRAME_T source = decoded_frame.stVFrame;
-        const auto ret = AXCL_IVPS_CropResizeVgp(&source, &output_frame_, &aspect);
+        const auto ret = TraceWorkerCall("AXCL_IVPS_CropResizeVgp.preprocess", [&] {
+            return AXCL_IVPS_CropResizeVgp(&source, &output_frame_, &aspect);
+        });
         if (ret != AX_SUCCESS) {
             ++statistics_.errors;
             LogError("[IVPS] AXCL_IVPS_CropResizeVgp failed: 0x%08X",
@@ -3187,9 +3396,11 @@ public:
             return true;
         }
         std::vector<std::uint8_t> host(kInputBytes);
-        const auto ret = axclrtMemcpy(host.data(),
-                                      reinterpret_cast<void*>(static_cast<std::uintptr_t>(physical_address_)),
-                                      host.size(), AXCL_MEMCPY_DEVICE_TO_HOST);
+        const auto ret = TraceWorkerCall("axclrtMemcpy.ivps-dump-D2H", [&] {
+            return axclrtMemcpy(host.data(),
+                               reinterpret_cast<void*>(static_cast<std::uintptr_t>(physical_address_)),
+                               host.size(), AXCL_MEMCPY_DEVICE_TO_HOST);
+        });
         if (ret != AXCL_SUCC) {
             LogError("[IVPS] diagnostic D2H readback failed: 0x%08X",
                      static_cast<unsigned int>(ret));
@@ -3313,7 +3524,9 @@ public:
         aspect.eAligns[1] = AX_IVPS_ASPECT_RATIO_VERTICAL_CENTER;
         aspect.nBgColor = 0;
         AX_VIDEO_FRAME_T source = decoded_frame.stVFrame;
-        const auto ivps_ret = AXCL_IVPS_CropResizeVgp(&source, &output_frame_, &aspect);
+        const auto ivps_ret = TraceWorkerCall("AXCL_IVPS_CropResizeVgp.snapshot", [&] {
+            return AXCL_IVPS_CropResizeVgp(&source, &output_frame_, &aspect);
+        });
         if (ivps_ret != AX_SUCCESS) {
             ++statistics_.errors;
             LogError("[SNAPSHOT] full-resolution AXCL_IVPS_CropResizeVgp failed: 0x%08X",
@@ -3329,10 +3542,12 @@ public:
             host_bgr->clear();
             return false;
         }
-        const auto copy_ret = axclrtMemcpy(
-            host_bgr->data(),
-            reinterpret_cast<const void*>(static_cast<std::uintptr_t>(physical_address_)),
-            host_bgr->size(), AXCL_MEMCPY_DEVICE_TO_HOST);
+        const auto copy_ret = TraceWorkerCall("axclrtMemcpy.snapshot-D2H", [&] {
+            return axclrtMemcpy(
+                host_bgr->data(),
+                reinterpret_cast<const void*>(static_cast<std::uintptr_t>(physical_address_)),
+                host_bgr->size(), AXCL_MEMCPY_DEVICE_TO_HOST);
+        });
         if (copy_ret != AXCL_SUCC) {
             ++statistics_.errors;
             LogError("[SNAPSHOT] full-resolution D2H readback failed: 0x%08X",
@@ -3417,7 +3632,7 @@ public:
 
     bool Open(const std::string& model, std::size_t input_bytes) {
         Close();
-        if (runner_.init(model.c_str()) != 0) {
+        if (TraceWorkerCall("runner.init", [&] { return runner_.init(model.c_str()); }) != 0) {
             LogError("[YOLO26] runner.init failed: %s", model.c_str());
             return false;
         }
@@ -3473,10 +3688,12 @@ public:
                      input_bytes_);
             return false;
         }
-        const auto ret = axclrtMemcpy(
-            reinterpret_cast<void*>(static_cast<std::uintptr_t>(input_physical_address_)),
-            reinterpret_cast<const void*>(static_cast<std::uintptr_t>(source_physical_address)),
-            input_bytes_, AXCL_MEMCPY_DEVICE_TO_DEVICE);
+        const auto ret = TraceWorkerCall("axclrtMemcpy.inference-D2D", [&] {
+            return axclrtMemcpy(
+                reinterpret_cast<void*>(static_cast<std::uintptr_t>(input_physical_address_)),
+                reinterpret_cast<const void*>(static_cast<std::uintptr_t>(source_physical_address)),
+                input_bytes_, AXCL_MEMCPY_DEVICE_TO_DEVICE);
+        });
         if (ret != AXCL_SUCC) {
             ++statistics_.errors;
             LogError("[YOLO26] BGR input D2D copy failed: 0x%08X",
@@ -3500,7 +3717,9 @@ public:
         if (!warmed_up_) {
             LogInfo("[YOLO26] warmup %d times using the shared runner input", kWarmupCount);
             for (int index = 0; index < kWarmupCount; ++index) {
-                if (const int ret = runner_.inference(kModelGroupId); ret != 0) {
+                if (const int ret = TraceWorkerCall("runner.inference.warmup", [&] {
+                        return runner_.inference(kModelGroupId);
+                    }); ret != 0) {
                     ++statistics_.errors;
                     LogError("[YOLO26] warmup inference failed: 0x%08X",
                              static_cast<unsigned int>(ret));
@@ -3511,7 +3730,9 @@ public:
         }
 
         const auto inference_begin = Clock::now();
-        if (const int ret = runner_.inference(kModelGroupId); ret != 0) {
+        if (const int ret = TraceWorkerCall("runner.inference", [&] {
+                return runner_.inference(kModelGroupId);
+            }); ret != 0) {
             ++statistics_.errors;
             LogError("[YOLO26] inference failed: 0x%08X", static_cast<unsigned int>(ret));
             return false;
@@ -3538,7 +3759,7 @@ public:
 
     void Close() {
         if (opened_) {
-            runner_.release();
+            TraceWorkerCall("runner.release", [&] { runner_.release(); });
             opened_ = false;
         }
         warmed_up_ = false;
@@ -3974,6 +4195,7 @@ const char* CameraRunStateName(CameraRunState state) {
 
 struct RouteSnapshot {
     CameraRunState state{CameraRunState::kStarting};
+    Clock::time_point published_at{};
     std::uint64_t input_packets{0};
     std::uint64_t skipped_before_idr{0};
     std::uint64_t ffmpeg_errors{0};
@@ -3997,6 +4219,17 @@ struct RouteSnapshot {
     double completed_recovery_downtime_ms{0.0};
     Clock::time_point recovery_started{};
 };
+
+bool RouteSnapshotIsStale(const RouteSnapshot& snapshot, Clock::time_point now) {
+    return snapshot.state == CameraRunState::kRunning &&
+           snapshot.published_at != Clock::time_point{} &&
+           now - snapshot.published_at >= kWorkerStallWarningThreshold;
+}
+
+double RouteSnapshotAgeMilliseconds(const RouteSnapshot& snapshot, Clock::time_point now) {
+    return snapshot.published_at == Clock::time_point{}
+               ? 0.0 : std::max(0.0, ElapsedMilliseconds(snapshot.published_at, now));
+}
 
 struct FrameSlotMetadata {
     std::uint64_t frame_uid{0};
@@ -4044,6 +4277,7 @@ public:
         next.completed_recovery_downtime_ms = completed_recovery_downtime_ms;
         next.recovery_started = recovery_started;
         std::lock_guard<std::mutex> lock(snapshot_mutex);
+        next.published_at = Clock::now();
         snapshot = next;
     }
 
@@ -4053,6 +4287,7 @@ public:
     }
 
     const std::size_t camera_id;
+    WorkerDiagnostics diagnostics;
     InterruptState interrupt;
     FfmpegRtspDemuxer demuxer;
     NativeVdec vdec;
@@ -4143,6 +4378,8 @@ public:
 
 class InferenceSharedState final {
 public:
+    WorkerDiagnostics diagnostics;
+
     void Publish(const InferenceStatistics& next) {
         std::lock_guard<std::mutex> lock(mutex_);
         statistics_ = next;
@@ -4263,10 +4500,13 @@ bool WaitForCameraRecovery(const std::atomic<bool>* stop_requested,
 
 void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_device_id,
                     Clock::time_point* processing_started, StartupGate* startup_gate,
+                    std::mutex* initial_rtsp_open_mutex,
                     InferenceScheduler* scheduler, std::atomic<bool>* stop_requested,
                     std::atomic<bool>* failed,
                     std::condition_variable* lifecycle_condition) {
     ScopedCameraLogContext log_context(static_cast<int>(route->camera_id));
+    g_worker_diagnostics = &route->diagnostics;
+    const std::string& source = options->sources[route->camera_id];
     AxclThreadContext thread_context;
     bool startup_reported = false;
     bool route_failed = false;
@@ -4282,9 +4522,22 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
             startup_reported = true;
             return;
         }
-        const RtspOpenResult initial_input_open =
-            route->demuxer.Open(options->source, options->input_kind,
-                                options->read_timeout_ms);
+        RtspOpenResult initial_input_open;
+        {
+            // Keep repeated-source startup from issuing concurrent RTSP handshakes.
+            std::unique_lock<std::mutex> initial_rtsp_lock(*initial_rtsp_open_mutex,
+                                                          std::defer_lock);
+            if (options->input_kind == InputKind::kRtsp) {
+                initial_rtsp_lock.lock();
+            }
+            const auto open_started = Clock::now();
+            LogInfo("[FFMPEG] initial %s open started", InputKindName(options->input_kind));
+            initial_input_open = route->demuxer.Open(source, options->input_kind,
+                                                    options->read_timeout_ms);
+            LogInfo("[FFMPEG] initial %s open finished: success=%d elapsed_ms=%.3f",
+                    InputKindName(options->input_kind), initial_input_open.successful() ? 1 : 0,
+                    ElapsedMilliseconds(open_started));
+        }
         if (!initial_input_open.successful()) {
             LogError("[FFMPEG] initial %s open failed: classification=%s error=%d; "
                      "startup retries are disabled",
@@ -4544,7 +4797,7 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
                            remaining_recovery_budget(),
                            static_cast<unsigned long long>(route->recovery_attempts));
                 const RtspOpenResult input_open =
-                    route->demuxer.Open(options->source, options->input_kind,
+                    route->demuxer.Open(source, options->input_kind,
                                         options->read_timeout_ms);
                 if (input_open.status == RtspIoStatus::kInterrupted &&
                     stop_requested->load(std::memory_order_relaxed)) {
@@ -4630,7 +4883,7 @@ void RunCameraRoute(CameraRoute* route, const Options* options, int runtime_devi
                 }
                 session_open = false;
                 const RtspOpenResult loop_open =
-                    route->demuxer.Open(options->source, options->input_kind,
+                    route->demuxer.Open(source, options->input_kind,
                                         options->read_timeout_ms);
                 if (loop_open.status == RtspIoStatus::kInterrupted &&
                     stop_requested->load(std::memory_order_relaxed)) {
@@ -4892,6 +5145,7 @@ void RunInferenceWorker(const std::vector<std::unique_ptr<CameraRoute>>* routes,
                         SnapshotWriter* snapshot_writer,
                         std::atomic<bool>* stop_requested, std::atomic<bool>* failed,
                         std::condition_variable* lifecycle_condition) {
+    g_worker_diagnostics = &shared_state->diagnostics;
     AxclThreadContext thread_context;
     Yolo26Inference yolo;
     bool startup_reported = false;
@@ -5051,6 +5305,8 @@ void PrintMultiStatistics(const Options& options, Clock::time_point started,
     for (std::size_t camera_id = 0; camera_id < routes.size(); ++camera_id) {
         const CameraRoute& route = *routes[camera_id];
         const RouteSnapshot snapshot = route.ReadSnapshot();
+        const double snapshot_age_ms = RouteSnapshotAgeMilliseconds(snapshot, now);
+        const bool snapshot_stale = RouteSnapshotIsStale(snapshot, now);
         const std::uint64_t inferred = route.inference_frames.load(std::memory_order_relaxed);
         const std::uint64_t infer_errors = route.inference_errors.load(std::memory_order_relaxed);
         const std::uint64_t detections = route.detections.load(std::memory_order_relaxed);
@@ -5082,8 +5338,8 @@ void PrintMultiStatistics(const Options& options, Clock::time_point started,
 
         char console_camera_text[96]{};
         std::snprintf(console_camera_text, sizeof(console_camera_text),
-                      "%sc%zu dec=%.1f infer=%.1f", camera_id == 0 ? "" : " | ",
-                      camera_id, decoded_fps, infer_fps);
+                      "%sc%zu dec=%.1f infer=%.1f%s", camera_id == 0 ? "" : " | ",
+                      camera_id, decoded_fps, infer_fps, snapshot_stale ? " [stale]" : "");
         console_cameras += console_camera_text;
 
         char final_console_camera_text[128]{};
@@ -5116,7 +5372,8 @@ void PrintMultiStatistics(const Options& options, Clock::time_point started,
                                                : snapshot.snapshot_capture.total_ms /
                                                      static_cast<double>(
                                                          snapshot.snapshot_capture.frames);
-        LogInfo("[%s_DETAIL] camera=%zu state=%s input_packets=%llu attempted_au=%llu "
+        LogInfo("[%s_DETAIL] camera=%zu state=%s snapshot_age_ms=%.3f snapshot_stale=%d "
+                "input_packets=%llu attempted_au=%llu "
                 "sent_au=%llu decoded_frames=%llu frame=%ux%u format=%d pts_us=%llu "
                 "vdec_errors=%llu vdec_stream_errors=%llu vdec_hw_errors=%llu "
                 "vdec_current_hw_errors=%llu last_error_code=0x%08X send_calls=%llu "
@@ -5137,6 +5394,7 @@ void PrintMultiStatistics(const Options& options, Clock::time_point started,
                 "recovery_attempts=%llu recovery_successes=%llu recovery_failures=%llu "
                 "recovery_downtime_ms=%.3f file_loops=%llu",
                 tag, camera_id, CameraRunStateName(snapshot.state),
+                snapshot_age_ms, snapshot_stale ? 1 : 0,
                 static_cast<unsigned long long>(snapshot.input_packets),
                 static_cast<unsigned long long>(snapshot.vdec.attempted_access_units),
                 static_cast<unsigned long long>(snapshot.vdec.sent_access_units),
@@ -5242,7 +5500,10 @@ ParseOptionsResult ParseOptions(int argc, char* argv[], Options* options) {
     command.add("no-pause", 0, "do not pause an independently opened Windows console on exit");
     command.add<std::string>("mode", 'r', "vdec-smoke | ivps-smoke | infer", false, "infer");
     command.add<std::string>("source", 's',
-                             "RTSP H.264 source URL; omit to loop the default local file",
+                             "RTSP H.264 URL overriding all four configured sources",
+                             false, "");
+    command.add<std::string>("file", 0,
+                             "local H.264 MP4/MOV or MPEG-PS file to loop on all four cameras",
                              false, "");
     command.add<std::string>("model", 'm', "YOLO26 AX model path", false, yolo26_defaults::kModelPath);
     command.add<std::string>("config", 'c', "AXCL JSON config path", false, "");
@@ -5276,9 +5537,19 @@ ParseOptionsResult ParseOptions(int argc, char* argv[], Options* options) {
         return ParseOptionsResult::kError;
     }
     const bool source_explicit = command.exist("source");
-    options->source = source_explicit ? command.get<std::string>("source")
-                                      : kDefaultMp4Path;
-    options->input_kind = source_explicit ? InputKind::kRtsp : InputKind::kLocalFile;
+    const bool file_explicit = command.exist("file");
+    if (source_explicit && file_explicit) {
+        std::fprintf(stderr, "--source and --file cannot be used together\n");
+        std::fflush(stderr);
+        return ParseOptionsResult::kError;
+    }
+    options->input_kind = file_explicit ? InputKind::kLocalFile : InputKind::kRtsp;
+    if (file_explicit || source_explicit) {
+        options->sources.fill(command.get<std::string>(file_explicit ? "file" : "source"));
+    } else {
+        std::copy(yolo26_defaults::kNativeRtspSources.begin(),
+                  yolo26_defaults::kNativeRtspSources.end(), options->sources.begin());
+    }
     options->model = command.get<std::string>("model");
     options->axcl_config = command.get<std::string>("config");
     options->dump_ivps = command.get<std::string>("dump-ivps");
@@ -5289,14 +5560,18 @@ ParseOptionsResult ParseOptions(int argc, char* argv[], Options* options) {
     options->read_timeout_ms = command.get<int>("read-timeout");
     options->statistics_interval_seconds = command.get<int>("stats-interval");
 
-    if (source_explicit && !IsRtspUrl(options->source)) {
-        std::fprintf(stderr, "--source must be an RTSP URL\n");
-        std::fflush(stderr);
-        return ParseOptionsResult::kError;
-    }
-    if (!source_explicit && !utilities::file_exist(options->source)) {
-        std::fprintf(stderr, "Default local file does not exist: %s\n",
-                     options->source.c_str());
+    if (options->input_kind == InputKind::kRtsp) {
+        for (std::size_t camera_id = 0; camera_id < kCameraCount; ++camera_id) {
+            if (!IsRtspUrl(options->sources[camera_id])) {
+                std::fprintf(stderr,
+                             "RTSP source for camera=%zu must be an rtsp:// or rtsps:// URL\n",
+                             camera_id);
+                std::fflush(stderr);
+                return ParseOptionsResult::kError;
+            }
+        }
+    } else if (!utilities::file_exist(options->sources.front())) {
+        std::fprintf(stderr, "--file must name a readable local file\n");
         std::fflush(stderr);
         return ParseOptionsResult::kError;
     }
@@ -5439,14 +5714,21 @@ int Run(const Options& options) {
                                           ? "until Ctrl+C"
                                           : std::to_string(options.duration_seconds) + "s";
     LogInfo("[CONFIG] mode=%s", ModeName(options.mode));
-    const std::string logged_source = options.input_kind == InputKind::kRtsp
-                                          ? RedactRtspUrl(options.source)
-                                          : options.source;
-    LogInfo("[CONFIG] input=%s source=%s (replicated across %zu independent pipelines)",
-            InputKindName(options.input_kind), logged_source.c_str(), kCameraCount);
+    LogInfo("[CONFIG] input=%s pipelines=%zu", InputKindName(options.input_kind), kCameraCount);
+    for (std::size_t camera_id = 0; camera_id < kCameraCount; ++camera_id) {
+        const std::string& source = options.sources[camera_id];
+        const std::string logged_source = options.input_kind == InputKind::kRtsp
+                                              ? RedactRtspUrl(source)
+                                              : source;
+        LogInfo("[CONFIG] camera=%zu source=%s", camera_id, logged_source.c_str());
+    }
     LogInfo("[CONFIG] model=%s",
             options.mode == RunMode::kInfer ? options.model.c_str() : "<not loaded>");
     LogInfo("[CONFIG] duration=%s", duration_text.c_str());
+    if (options.input_kind == InputKind::kRtsp) {
+        LogInfo("[CONFIG] initial RTSP opens=serialized; processing starts after all "
+                "cameras are ready; startup retries=disabled");
+    }
     if (options.mode == RunMode::kInfer) {
         LogInfo("[CONFIG] pipeline=%zu demux/VDEC workers, %zu VDEC groups, "
                 "one BGR latest-frame slot per camera, one inference worker",
@@ -5487,6 +5769,13 @@ int Run(const Options& options) {
             kCameraRecoveryMaxAttempts,
             static_cast<long long>(kCameraRecoveryRetryDelay.count()),
             static_cast<long long>(kCameraRecoveryStableWindow.count()));
+    LogInfo("[CONFIG] diagnostics=worker-call-watchdog poll_s=%lld pending_call_warning_s=%lld "
+            "running_snapshot_stale_s=%lld repeat_s=%lld action=diagnostic-only; "
+            "FAULT_QUERY_BEGIN/END are flushed; normal calls are not logged per frame",
+            static_cast<long long>(kWorkerDiagnosticPeriod.count()),
+            static_cast<long long>(kWorkerStallWarningThreshold.count()),
+            static_cast<long long>(kWorkerStallWarningThreshold.count()),
+            static_cast<long long>(kWorkerStallWarningRepeat.count()));
     if (options.input_kind == InputKind::kLocalFile) {
         LogInfo("[CONFIG] local file playback=original DTS pace, cumulative PTS, infinite loop; "
                 "normal EOF does not consume the RTSP recovery budget");
@@ -5496,6 +5785,7 @@ int Run(const Options& options) {
     }
 
     StartupGate startup_gate;
+    std::mutex initial_rtsp_open_mutex;
     InferenceScheduler scheduler;
     InferenceSharedState inference_state;
     std::mutex lifecycle_mutex;
@@ -5510,7 +5800,8 @@ int Run(const Options& options) {
         for (auto& route : routes) {
             route_threads.emplace_back(RunCameraRoute, route.get(), &options,
                                        environment.runtime_device_id(), &processing_started,
-                                       &startup_gate, &scheduler, &stop_requested, &failed,
+                                       &startup_gate, &initial_rtsp_open_mutex, &scheduler,
+                                       &stop_requested, &failed,
                                        &lifecycle_condition);
         }
         if (options.mode == RunMode::kInfer) {
@@ -5550,13 +5841,15 @@ int Run(const Options& options) {
         const auto statistics_period =
             std::chrono::seconds(options.statistics_interval_seconds);
         auto next_statistics = processing_started + statistics_period;
+        auto next_diagnostics = processing_started + kWorkerDiagnosticPeriod;
+        std::array<WorkerStallMonitor, kCameraCount + 1> stall_monitors{};
         const auto duration_deadline = options.duration_seconds > 0
                                            ? processing_started +
                                                  std::chrono::seconds(options.duration_seconds)
                                            : Clock::time_point::max();
 
         while (!stop_requested.load(std::memory_order_relaxed)) {
-            const auto wake_time = std::min(next_statistics, duration_deadline);
+            const auto wake_time = std::min({next_statistics, next_diagnostics, duration_deadline});
             std::unique_lock<std::mutex> lifecycle_lock(lifecycle_mutex);
             lifecycle_condition.wait_until(lifecycle_lock, wake_time, [&] {
                 return stop_requested.load(std::memory_order_relaxed);
@@ -5567,6 +5860,23 @@ int Run(const Options& options) {
             if (now >= duration_deadline) {
                 stop_requested.store(true, std::memory_order_relaxed);
                 break;
+            }
+            if (now >= next_diagnostics && !stop_requested.load(std::memory_order_relaxed)) {
+                // Diagnose workers from Host metadata only; querying AXCL here could
+                // block the only thread still able to report a device-side stall.
+                for (std::size_t camera_id = 0; camera_id < routes.size(); ++camera_id) {
+                    const CameraRoute& route = *routes[camera_id];
+                    const RouteSnapshot snapshot = route.ReadSnapshot();
+                    CheckWorkerStall(route.diagnostics, "camera", static_cast<int>(camera_id),
+                                     CameraRunStateName(snapshot.state),
+                                     RouteSnapshotAgeMilliseconds(snapshot, now),
+                                     RouteSnapshotIsStale(snapshot, now), &stall_monitors[camera_id]);
+                }
+                if (options.mode == RunMode::kInfer) {
+                    CheckWorkerStall(inference_state.diagnostics, "inference", -1, "n/a", 0.0,
+                                     false, &stall_monitors[kCameraCount]);
+                }
+                AdvancePeriodicDeadline(Clock::now(), kWorkerDiagnosticPeriod, &next_diagnostics);
             }
             if (now >= next_statistics &&
                 !stop_requested.load(std::memory_order_relaxed)) {

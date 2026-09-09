@@ -16,9 +16,19 @@
 
 #pragma once
 
+#include <array>
+
 namespace yolo26_defaults {
 
 inline constexpr char kModelPath[] = R"(D:\yolo26\yolo26m.axmodel)";
 inline constexpr char kRtspSource[] = R"(rtsp://admin:Htl20243@192.168.0.201:554/Streaming/Channels/101)";
+
+// Native sample defaults, ordered by camera ID; entries may use different URLs.
+inline constexpr std::array<const char*, 4> kNativeRtspSources{{
+    kRtspSource,  // camera=0
+    kRtspSource,  // camera=1
+    kRtspSource,  // camera=2
+    kRtspSource,  // camera=3
+}};
 
 }  // namespace yolo26_defaults
